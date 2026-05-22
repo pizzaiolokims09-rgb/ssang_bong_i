@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Data files
+data/
+*.db
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# Scratch files (testing)
+scratch_*.py

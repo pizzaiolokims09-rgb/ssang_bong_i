@@ -1,0 +1,415 @@
+# 한국투자증권 자동매매 시스템 구축 가이드
+
+> **안내** 이 문서는 HTML 강의자료의 실습용 파생 문서입니다. 특정 AI(예: Brain v14) 의존성을 배제하고 독립적으로 구현 가능한 형태로 재구성되었습니다.
+> 
+
+---
+
+## 📌 파이프라인 및 소요 시간
+
+총 소요 시간은 약 4시간이며, 단계별 분할 진행이 가능합니다.
+
+| 단계 | 작업 내용 | 결과물 | 소요 시간 |
+| --- | --- | --- | --- |
+| **0. 사전 준비** | 환경 세팅 | 계좌 개설, 개발 환경 구축 | 30분 |
+| **1. 모의투자 신청** | 테스트 환경 | 가상자금 1억원 모의계좌 | 5분 |
+| **2. 앱키 발급** | API 권한 | App Key / App Secret | 5분 |
+| **3. 텔레그램 봇** | 알림 채널 | 일반봇 + 어드민봇 | 10분 |
+| **4. 환경변수 설정** | 보안 | `.env` 파일 작성 | 5분 |
+| **5. OAuth 테스트** | 통신 확인 | Access Token, 잔고 조회 | 10분 |
+| **6. 시그널 생성** | 매매 로직 | RSI + 거래량 기반 룰 | 30분 |
+| **7. 포지션 사이징** | 리스크 관리 | 자본 한도 및 종목 상한 계산 | 15분 |
+| **8. 승인 시스템** | 수동 개입 | 텔레그램 알림 + CLI 승인 큐 | 30분 |
+| **9. 주문 발송** | 체결 요청 | HashKey 생성 및 매수/매도 | 30분 |
+| **10. 모니터링** | 상태 추적 | 폴링 방식 잔고/체결 조회 | 20분 |
+| **11. 손절/익절** | 자동 청산 | Stop-loss / Take-profit | 20분 |
+| **12. 실전 전환** | 환경 변경 | 모의 → 실전 체크리스트 | 5분 |
+
+Sheets로 내보내기
+
+---
+
+## ⚙️ Step 0. 사전 준비
+
+### 0-1. 시스템 요구사항
+
+- **OS:** macOS / Windows / Linux
+- **Language:** Python 3.11 이상 (3.13 권장)
+- **Account:** 한국투자증권 계좌 (비대면 개설 가능)
+
+### 0-2. 프로젝트 환경 구성
+
+터미널에서 아래 명령어를 순차적으로 실행합니다.
+
+Bash
+
+`mkdir my-auto-trader && cd my-auto-trader
+python3 -m venv .venv
+source .venv/bin/activate    # Windows의 경우: .venv\Scripts\activate
+pip install requests python-dotenv pandas yfinance`
+
+### 0-3. 디렉토리 구조
+
+프로젝트 루트 폴더에 아래와 같은 구조를 생성합니다.
+
+Plaintext
+
+`my-auto-trader/
+├── .env                 # API 키 등 환경변수 (Git 업로드 금지)
+├── .gitignore
+├── trader/
+│   ├── __init__.py
+│   ├── kis_client.py    # KIS API 통신 모듈
+│   ├── telegram.py      # 알림 발송 모듈
+│   ├── signals.py       # 매수/매도 시그널 생성
+│   ├── portfolio.py     # 포지션 및 자산 배분
+│   ├── approval.py      # 주문 승인 큐 관리
+│   ├── orders.py        # KIS 주문 실행
+│   └── monitor.py       # 체결 및 포지션 추적
+├── data/                # 로컬 DB 저장소 (자동 생성)
+└── run.py               # 메인 실행 파일`
+
+`.gitignore` 설정:
+
+Plaintext
+
+`.env
+data/
+__pycache__/
+.venv/
+*.log`
+
+---
+
+## 🏦 Step 1. 모의투자 신청
+
+> ⚠️ **주의** 시스템 검증이 완료되기 전까지 실제 자금을 이용한 매매는 금지합니다.
+> 
+1. [KIS Developers API Portal](https://apiportal.koreainvestment.com/) 접속 및 로그인
+2. 좌측 메뉴 **국내주식 모의투자** ➡️ **모의투자 신청**
+3. 가상 자금 ₩100,000,000 지급 확인
+4. 발급된 모의계좌번호 복사 (`50XXXXXXXX-01` 형식)
+
+---
+
+## 🔑 Step 2. API 인증키 발급
+
+1. KIS Developers 좌측 메뉴 **오픈API** ➡️ **앱등록**
+2. 앱 이름 입력 (예: `my_trader`), 콜백 URL은 공란 유지
+3. 발급 정보 저장 (최초 1회만 노출되므로 즉시 복사)
+
+| 항목 | 형식 | 예시 |
+| --- | --- | --- |
+| **App Key** | 36자 영문/숫자 | `PSXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX` |
+| **App Secret** | 180자 영문/숫자 | `aBcDeFgH...` |
+
+Sheets로 내보내기
+
+---
+
+## 📱 Step 3. 텔레그램 봇 생성
+
+1. 텔레그램에서 `@BotFather` 검색 후 `/newbot` 명령어 입력
+2. 봇 이름과 사용자명(반드시 `_bot`으로 종료) 설정
+3. 발급된 **HTTP API Token** 메모
+4. 시스템 알림용 일반 봇 1개, 관리용 어드민 봇 1개 등 총 2개 생성 권장
+5. 각 봇에 `/start` 메시지 전송 후, 브라우저에서 아래 URL 접속하여 본인의 `chat_id` 획득
+    - `https://api.telegram.org/bot<TOKEN>/getUpdates`
+
+---
+
+## 🔒 Step 4. 환경변수(.env) 설정
+
+프로젝트 최상단에 `.env` 파일을 생성하고 발급받은 정보를 기입합니다.
+
+Bash
+
+`# [ KIS Open API ]
+KIS_APP_KEY=발급받은_App_Key
+KIS_APP_SECRET=발급받은_App_Secret_180자
+KIS_ACCOUNT_NO=50XXXXXXXX
+KIS_ACCOUNT_PRODUCT_CODE=01
+KIS_HTS_ID=본인_HTS_ID
+KIS_TRADING_ENV=demo            # demo (모의) | real (실전)
+ENABLE_LIVE_TRADING=false       # 안전장치 (실전 전환 시 true)
+
+# [ Telegram Bot ]
+TELEGRAM_BOT_TOKEN=일반봇_토큰
+TELEGRAM_CHAT_ID=본인_Chat_ID
+TELEGRAM_ADMIN_BOT_TOKEN=어드민봇_토큰
+TELEGRAM_ADMIN_CHAT_ID=본인_Chat_ID
+
+# [ Trading Parameters ]
+TOTAL_CAPITAL=10000000          # 운영 자본금 (모의: 1천만원)
+MAX_POSITIONS=3                 # 동시 보유 최대 종목 수
+MAX_SINGLE_WEIGHT=0.30          # 단일 종목 최대 비중 (30%)
+CASH_BUFFER=0.20                # 현금 보유 비중 (20%)
+STOP_LOSS_PCT=0.05              # 손절 라인 (5%)
+TAKE_PROFIT_PCT=0.09            # 익절 라인 (9%)
+REQUIRE_APPROVAL=true           # 수동 승인 절차 활성화 여부`
+
+---
+
+## 💻 Step 5 ~ 11. 핵심 모듈 구현
+
+> 각 파일에 하단 코드를 작성합니다.
+> 
+
+Python
+
+`import json
+import os
+import time
+from pathlib import Path
+from datetime import datetime, timedelta
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class KISClient:
+    def __init__(self):
+        self.app_key = os.environ["KIS_APP_KEY"]
+        self.app_secret = os.environ["KIS_APP_SECRET"]
+        self.account_no = os.environ["KIS_ACCOUNT_NO"]
+        self.account_pd = os.environ.get("KIS_ACCOUNT_PRODUCT_CODE", "01")
+        self.env = os.environ.get("KIS_TRADING_ENV", "demo")
+
+        self.base_url = (
+            "https://openapi.koreainvestment.com:9443"
+            if self.env == "real"
+            else "https://openapivts.koreainvestment.com:29443"
+        )
+        self._token_cache = Path("data/kis_token.json")
+        self._token_cache.parent.mkdir(parents=True, exist_ok=True)
+
+    def get_access_token(self) -> str:
+        if self._token_cache.exists():
+            cached = json.loads(self._token_cache.read_text())
+            expires_at = datetime.fromisoformat(cached["expires_at"])
+            if expires_at > datetime.now() + timedelta(minutes=5):
+                return cached["token"]
+
+        resp = requests.post(
+            f"{self.base_url}/oauth2/tokenP",
+            headers={"content-type": "application/json"},
+            json={
+                "grant_type": "client_credentials",
+                "appkey": self.app_key,
+                "appsecret": self.app_secret,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        token = resp.json()["access_token"]
+        expires_at = datetime.now() + timedelta(hours=23)
+        self._token_cache.write_text(json.dumps({
+            "token": token,
+            "expires_at": expires_at.isoformat(),
+        }))
+        return token
+
+    def _headers(self, tr_id: str) -> dict:
+        return {
+            "content-type": "application/json; charset=utf-8",
+            "authorization": f"Bearer {self.get_access_token()}",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+            "tr_id": tr_id,
+            "custtype": "P",
+        }
+
+    def _hashkey(self, payload: dict) -> str:
+        resp = requests.post(
+            f"{self.base_url}/uapi/hashkey",
+            headers={
+                "content-type": "application/json",
+                "appkey": self.app_key,
+                "appsecret": self.app_secret,
+            },
+            json=payload,
+            timeout=10,
+        )
+        return resp.json()["HASH"]
+
+    def get_balance(self) -> dict:
+        tr_id = "VTTC8434R" if self.env == "demo" else "TTTC8434R"
+        resp = requests.get(
+            f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance",
+            headers=self._headers(tr_id),
+            params={
+                "CANO": self.account_no,
+                "ACNT_PRDT_CD": self.account_pd,
+                "AFHR_FLPR_YN": "N", "OFL_YN": "",
+                "INQR_DVSN": "02", "UNPR_DVSN": "01",
+                "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N",
+                "PRCS_DVSN": "01",
+                "CTX_AREA_FK100": "", "CTX_AREA_NK100": "",
+            },
+            timeout=10,
+        )
+        return resp.json()
+
+    def get_quote(self, ticker: str) -> dict:
+        resp = requests.get(
+            f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price",
+            headers=self._headers("FHKST01010100"),
+            params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker},
+            timeout=10,
+        )
+        output = resp.json().get("output", {})
+        return {
+            "current": float(output.get("stck_prpr", 0)),
+            "ask1": float(output.get("askp1", 0)),
+            "bid1": float(output.get("bidp1", 0)),
+        }`
+
+Python
+
+`import pandas as pd
+import yfinance as yf
+
+WATCHLIST = ["005930", "000660", "035420", "035720", "005380", "207940", "068270", "051910"]
+
+def _yf_ticker(code: str) -> str:
+    return f"{code}.KS"
+
+def _rsi(closes: pd.Series, period: int = 14) -> float:
+    delta = closes.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = -delta.clip(upper=0).rolling(period).mean()
+    rs = gain / loss.replace(0, 1e-9)
+    rsi = 100 - 100 / (1 + rs)
+    return float(rsi.iloc[-1])
+
+def find_candidates(min_score: int = 2) -> list[dict]:
+    candidates = []
+    for code in WATCHLIST:
+        try:
+            df = yf.download(_yf_ticker(code), period="3mo", progress=False)
+            if df.empty or len(df) < 30: continue
+            
+            closes, volumes = df["Close"], df["Volume"]
+            current = float(closes.iloc[-1])
+            score, reasons = 0, []
+
+            rsi = _rsi(closes)
+            if 30 < rsi < 50:
+                score += 1
+                reasons.append(f"RSI {rsi:.0f}")
+
+            ma5 = closes.rolling(5).mean().iloc[-1]
+            ma5_yesterday = closes.rolling(5).mean().iloc[-2]
+            if current > ma5 and closes.iloc[-2] <= ma5_yesterday:
+                score += 1
+                reasons.append("5일선 돌파")
+
+            vol_avg = volumes.rolling(20).mean().iloc[-1]
+            if volumes.iloc[-1] > vol_avg * 1.5:
+                score += 1
+                reasons.append("거래량 급증")
+
+            if score >= min_score:
+                candidates.append({"ticker": code, "current_price": current, "score": score, "reasons": reasons})
+        except Exception as e: pass
+
+    candidates.sort(key=lambda x: -x["score"])
+    return candidates`
+
+Python
+
+`import math
+import os
+from typing import List, Dict
+
+def build_orders(candidates: List[Dict], get_quote_fn) -> List[Dict]:
+    capital = float(os.environ.get("TOTAL_CAPITAL", 10000000))
+    cash_buffer = float(os.environ.get("CASH_BUFFER", 0.20))
+    max_pos = int(os.environ.get("MAX_POSITIONS", 3))
+    max_w = float(os.environ.get("MAX_SINGLE_WEIGHT", 0.30))
+
+    deployable = capital * (1 - cash_buffer)
+    per_position = deployable * max_w
+    cost_multiplier = 1.001
+
+    orders = []
+    for c in candidates[:max_pos]:
+        quote = get_quote_fn(c["ticker"])
+        price = quote["ask1"] or quote["current"]
+        if price <= 0: continue
+
+        quantity = math.floor(per_position / (price * cost_multiplier))
+        if quantity <= 0: continue
+
+        orders.append({
+            "ticker": c["ticker"], "side": "BUY", "quantity": quantity,
+            "limit_price": int(price), "estimated_cost": quantity * price * cost_multiplier,
+            "score": c["score"], "reasons": c["reasons"],
+        })
+
+    total_cost = sum(o["estimated_cost"] for o in orders)
+    if total_cost > deployable:
+        scale = deployable / total_cost
+        for o in orders:
+            o["quantity"] = math.floor(o["quantity"] * scale)
+            o["estimated_cost"] = o["quantity"] * o["limit_price"] * cost_multiplier
+
+    return [o for o in orders if o["quantity"] > 0]`
+
+*(텔레그램 전송, 주문 승인 큐, 주문 발송, 폴링 모니터링 코드는 기존 원본 코드 블록을 노션 파이썬 코드 블록 형식으로 동일하게 유지하여 삽입하십시오.)*
+
+---
+
+## 🛡️ 시스템 안전장치 가이드라인
+
+`.env` 파일 및 `orders.py` 모듈에 필수적으로 적용해야 하는 방어 로직입니다.
+
+- [x]  [x] **마스터 스위치 (Kill Switch):** `ENABLE_LIVE_TRADING=false` 설정 시 물리적 주문 차단.
+- [x]  [x] **일일 손실 한도 (Daily Drawdown Limit):** `MAX_DAILY_LOSS_PCT` 도달 시 당일 신규 진입 즉각 중지.
+- [x]  [x] **비중 제한:** `MAX_SINGLE_WEIGHT` 설정을 통한 단일 종목 리스크 분산.
+- [x]  [x] **서킷 브레이커:** API 통신 오류 5회 연속 발생 시 일정 시간 시스템 정지.
+- [x]  [x] **데이터 보관:** 로컬 SQLite를 이용한 매매 이력 전체 백업.
+
+---
+
+## 🚀 실전 매매 전환 체크리스트
+
+모의투자에서 실전 계좌로 이관하기 전 반드시 확인해야 할 사항입니다.
+
+- [ ]  [ ] **기간 검증:** 모의투자 환경에서 최소 2주(10거래일) 이상 운영.
+- [ ]  [ ] **성과 검증:** 승률 50% 이상, 수익 계수(Profit Factor) 1.5 이상 달성 확인.
+- [ ]  [ ] **통신 검증:** 텔레그램 체결/에러 알림 누락 없음 확인.
+- [ ]  [ ] **로직 검증:** 설정한 손절(Stop-loss) 및 익절(Take-profit) 정상 작동 1건 이상 확인.
+- [ ]  [ ] **코드 동결:** 실전 투입 전 최소 1주일간 로직 변경 금지.
+- [ ]  [ ] **초기 자본:** 실전 전환 시 최초 운용 자본금은 ₩1,000,000 이하로 제한.
+
+### 실전 전환 절차
+
+1. `.env` 파일 수정: `KIS_TRADING_ENV=real`, `ENABLE_LIVE_TRADING=true`, `TOTAL_CAPITAL=1000000`
+2. 모의투자용 캐시 토큰 삭제: `rm data/kis_token.json`
+3. 잔고 조회 스크립트 실행하여 실계좌 연동 확인
+4. 첫 주문은 1종목 1주로 축소하여 단위 테스트 진행
+
+---
+
+## 💡 FAQ
+
+**Q. 모의투자에서는 구동되나 실전에서 작동하지 않습니다.**
+
+> `KIS_TRADING_ENV=real` 변경 여부를 확인하십시오. 상태 변경 시 Base URL과 거래소 TR ID가 실전용으로 전환되어야 합니다.
+> 
+
+**Q. "EGW00121: 거래소 코드 오류"가 발생합니다.**
+
+> 종목 코드가 코스닥 소속이나 코스피 거래소로 데이터가 전송된 경우입니다. 거래소 구분이 필요한 신규 상장 종목인지 확인하십시오.
+> 
+
+**Q. API 토큰 발급 횟수 제한이 있습니까?**
+
+> 네, 24시간 기준 과도한 재발급 시 접근이 차단될 수 있습니다. `kis_client.py`에 구현된 토큰 캐싱 로직을 반드시 유지하십시오.
+> 
+
+---
+
+**면책 조항 (Disclaimer)** 본 시스템 및 가이드는 알고리즘 트레이딩 구축을 위한 기술적 참고용입니다. API 오류, 네트워크 지연, 예기치 않은 버그 등으로 인한 재정적 손실이 발생할 수 있으며, 실제 자금 운용에 따른 모든 책임은 사용자 본인에게 있습니다. 시스템 검증은 모의투자 환경에서 선행되어야 합니다.
