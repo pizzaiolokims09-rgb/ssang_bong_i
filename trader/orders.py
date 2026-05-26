@@ -362,6 +362,9 @@ class OrderManager:
                     "peak_200d": route_result.get("peak_200d", 0),
                     "spider_levels": track_info.get("spider_levels", []),
                     "dynamic_sl_price": route_result.get("dynamic_sl_price", 0),
+                    "atr_value": route_result.get("atr_value", 0),
+                    "atr_sl_price": route_result.get("atr_sl_price", 0),
+                    "atr_tp_price": route_result.get("atr_tp_price", 0),
                 }
                 self._save_positions()
                 logger.info(f"[Order] 1차 시장가 체결: {ticker} Track {track} qty={quantity} (비율 {target_ratio[0]*100}%)")
@@ -387,6 +390,9 @@ class OrderManager:
                     "trigger_candle_low": route_result.get("trigger_candle_low", 0),
                     "peak_200d": route_result.get("peak_200d", 0),
                     "dynamic_sl_price": route_result.get("dynamic_sl_price", 0),
+                    "atr_value": route_result.get("atr_value", 0),
+                    "atr_sl_price": route_result.get("atr_sl_price", 0),
+                    "atr_tp_price": route_result.get("atr_tp_price", 0),
                 }
                 self._save_pending()
                 logger.info(f"[Order] 지정가 매수 대기: {ticker} Track {track} qty={quantity} price={entry_price:,} (TTL={self.PENDING_TTL}초)")
@@ -616,6 +622,9 @@ class OrderManager:
             "peak_200d": pend.get("peak_200d", 0),
             "spider_levels": pend.get("spider_levels", []),
             "dynamic_sl_price": pend.get("dynamic_sl_price", 0),
+            "atr_value": pend.get("atr_value", 0),
+            "atr_sl_price": pend.get("atr_sl_price", 0),
+            "atr_tp_price": pend.get("atr_tp_price", 0),
         }
         del self.pending_orders[ticker]
         self._save_positions()

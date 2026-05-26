@@ -47,6 +47,7 @@ def main():
     from trader.monitor import PositionMonitor
     from trader.telegram_bot import TelegramBot
     from trader.journal import TradeJournal
+    from trader.ai_fundamental import FundamentalScanner
 
     # ──────────────────────────────────────
     # 모듈 초기화
@@ -62,6 +63,7 @@ def main():
     monitor = PositionMonitor(kis, orders)
     telegram = TelegramBot()
     journal = TradeJournal(council)
+    fundamental = FundamentalScanner()  # Phase 3: Fail-Close 최종 관문
 
     # 텔레그램 명령어 및 콜백 등록
     def cmd_status():
@@ -126,6 +128,39 @@ def main():
     def confirm_buy_execute(ticker: str):
         telegram.send(f"🛒 {ticker} 추가 매수는 현재 개발 중인 기능입니다.")
 
+    # -------- 긴급익절 --------
+    def cmd_take_profit_menu():
+        """수익 중인 종목 목록을 보여주고 선택하면 즉시 익절"""
+        if not orders.positions:
+            telegram.send("⚠️ 현재 보유 중인 종목이 없습니다.")
+            return
+        # 전체 보유 종목 표시 (수익/손실 여부와 무관하게 선택 가능)
+        telegram.send_position_keyboard(orders.positions, "ask_tp", "💰 <b>어떤 종목을 긴급 익절할까요?</b>")
+
+    def ask_tp_execute(ticker: str):
+        pos = orders.positions.get(ticker, {})
+        name = pos.get("name", ticker)
+        entry = pos.get("entry_price", 0)
+        quote = kis.get_quote(ticker)
+        current = quote.get("current", entry)
+        pnl_pct = (current - entry) / entry * 100 if entry > 0 else 0
+        telegram.send_confirm_inline(
+            message=f"<b>{name}</b> 종목을 시장가로 전량 매도합니다.\n현재 손익: {pnl_pct:+.2f}%\n\n정말 실행하시겠습니까?",
+            confirm_data=f"confirm_tp_{ticker}"
+        )
+
+    def confirm_tp_execute(ticker: str):
+        if ticker in orders.positions:
+            r = orders.sell(ticker, reason="긴급익절(수동)")
+            if r:
+                telegram.notify_sell(r)
+                journal.record_trade(r, orders.total_capital)
+                telegram.send(f"✅ {ticker} 긴급익절 완료.")
+            else:
+                telegram.send(f"❌ {ticker} 매도 주문 실패. 증권사 API를 확인하세요.")
+        else:
+            telegram.send(f"⚠️ {ticker} 종목을 보유하고 있지 않습니다.")
+
     # -------- 마스터 비상정지 --------
     def cmd_emergency_stop_ask():
         telegram.send_confirm_inline(
@@ -144,11 +179,17 @@ def main():
         orders.kill_switch = False
         telegram.notify_system("봇 재개됨. 킬 스위치 해제.")
 
+    # /start 명령어 (메뉴 재전송)
+    def cmd_start():
+        telegram.send_menu()
+
     # 텍스트 명령어 매핑 (탭다운 버튼 텍스트)
+    telegram.register_command("start", cmd_start)
     telegram.register_command("상태", cmd_status)
     telegram.register_command("수익", cmd_profit)
     telegram.register_command("매매일지", cmd_journal)
     telegram.register_command("비상청산", cmd_emergency_menu)
+    telegram.register_command("긴급익절", cmd_take_profit_menu)
     telegram.register_command("추가매수", cmd_add_buy_menu)
     telegram.register_command("비상정지", cmd_emergency_stop_ask)
     telegram.register_command("재개시", cmd_resume)
@@ -160,6 +201,9 @@ def main():
     
     telegram.register_command("ask_buy", ask_buy_execute)            # 종목 선택됨 -> 2단계 물어보기
     telegram.register_command("confirm_buy", confirm_buy_execute)    # 컨펌됨 -> 진짜 사기
+
+    telegram.register_command("ask_tp", ask_tp_execute)              # 긴급익절 종목 선택됨
+    telegram.register_command("confirm_tp", confirm_tp_execute)      # 긴급익절 컨펌됨
 
     telegram.register_command("confirm_stop", confirm_emergency_stop) # 비상정지 컨펌됨
 
@@ -384,13 +428,7 @@ def main():
                         else:
                             telegram.send("📋 장마감 점검 완료: 정리 대상 없음 (전 종목 홀드)")
 
-                # 5) 정오(12:00) 이후 단타(Track A) 정리 (본절 탈출 및 12:30 이후 모멘텀 상실 약손절)
-                if current_hour >= 12 and current_hour < 15:  # 15시 전까지만 수행
-                    midday_results = monitor.check_midday_liquidation(current_hour, current_minute)
-                    for r in midday_results:
-                        telegram.notify_sell(r)
-                        journal.record_trade(r, orders.total_capital)
-
+                # 5) 점심정리 로직 제거됨 (사용자 요청)
 
             # ─────────────────────────────
             # Phase 1 + Phase 2 스캔 (60초 간격)
@@ -817,6 +855,30 @@ def main():
                             f"(+{change_from_prev*100:.1f}%) -> 진입 불가"
                         )
                         continue
+
+                # ─────── Phase 3: Fail-Close 최종 관문 ───────
+                track = route_result.get("track", "")
+                quant_summary = (
+                    f"Track: {track}, "
+                    f"신뢰도: {route_result.get('confidence', 0):.0%}, "
+                    f"ATR: {route_result.get('atr_value', 0):,.0f}, "
+                    f"진입가: {route_result.get('entry_price', 0):,}"
+                )
+                gate = fundamental.gate_check(
+                    stock.get("name", ticker), ticker, track,
+                    quant_summary=quant_summary
+                )
+                if gate["verdict"] == "REJECT":
+                    logger.info(
+                        f"[Gate REJECT] {stock['name']}({ticker}) "
+                        f"Phase 3 검증 실패 -> 매수 차단. "
+                        f"사유: {gate.get('summary', '')[:100]}")
+                    continue
+                elif gate["verdict"] == "REDUCE":
+                    logger.info(
+                        f"[Gate REDUCE] {stock['name']}({ticker}) "
+                        f"Phase 3 비중 삭감. {gate.get('summary', '')[:100]}")
+                    route_result["_budget_reduce"] = True  # orders.buy에서 50% 삭감 처리
 
                 # ─────── 주문 실행 ───────
                 buy_result = orders.buy(ticker, route_result)

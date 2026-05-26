@@ -5,6 +5,8 @@ monitor.py - 포지션 모니터링, 익절/손절 트레일링 스톱
 import logging
 from datetime import datetime
 
+from trader.quant_indicators import get_sell_signals
+
 logger = logging.getLogger("ssangbong.monitor")
 
 
@@ -26,6 +28,7 @@ class PositionMonitor:
         반환: 체결된 매도 내역 리스트
         """
         results = []
+        daily_candles_cache = {}  # 4대 매도 트리거용 일봉 캐시 (종목별 1회만 조회)
         tickers = list(self.orders.positions.keys())
 
         for ticker in tickers:
@@ -120,9 +123,52 @@ class PositionMonitor:
                 continue
 
             if partial_tp_done:
-                # 50% 익절 완료된 경우, 고정 % 트레일링 스탑은 사용하지 않음 ("언제든 하락할 수 있으므로")
-                # 본절가(dynamic_sl) 위협 전까지는 추세를 타고 홀딩 (추후 5분봉 피벗 기반 청산 로직 연계)
-                pass
+                # 50% 익절 완료 후: 4대 매도 트리거로 추세 전환 감지 시 청산
+                # 분봉 데이터 조회 (1분봉)
+                minute_candles = self.kis.get_minute_chart(ticker)
+                daily_cndls = self.kis.get_daily_chart(ticker) if daily_candles_cache.get(ticker) is None else daily_candles_cache.get(ticker)
+                if not daily_cndls:
+                    daily_cndls = []
+                daily_candles_cache[ticker] = daily_cndls
+
+                signals = get_sell_signals(minute_candles or [], daily_cndls)
+                adx = signals["adx"]
+
+                # 1) 패닉셀 → ADX 무관, 무조건 즉시 청산
+                if signals["panic_sell"]:
+                    logger.critical(f"[4T] {ticker} 패닉셀 감지! 즉시 청산")
+                    r = self.orders.sell(ticker, reason="패닉셀 감지 (거래량 3배+ 폭발)")
+                    if r:
+                        r["trigger"] = "PANIC_SELL"
+                        results.append(r)
+                    continue
+
+                # 2) MACD 음전환 → 추세 전환 시그널
+                elif signals["macd_bearish"]:
+                    logger.info(f"[4T] {ticker} MACD 매도 시그널 (Hist={signals['macd_histogram']:.2f})")
+                    r = self.orders.sell(ticker, reason=f"MACD 매도 시그널 (Hist={signals['macd_histogram']:.2f})")
+                    if r:
+                        r["trigger"] = "MACD_SELL"
+                        results.append(r)
+                    continue
+
+                # 3) 데드크로스 → ADX 약세(< 20)일 때만 실행
+                elif signals["dead_cross"] and adx < 20:
+                    logger.info(f"[4T] {ticker} 데드크로스 + ADX 약세({adx:.1f}) → 청산")
+                    r = self.orders.sell(ticker, reason=f"데드크로스 (ADX={adx:.1f})")
+                    if r:
+                        r["trigger"] = "DEAD_CROSS"
+                        results.append(r)
+                    continue
+
+                # 4) RSI 과매수 → ADX 약세(< 20)일 때만 실행 (강한 추세에선 무시)
+                elif signals["rsi_overbought"] and adx < 20:
+                    logger.info(f"[4T] {ticker} RSI 과매수({signals['rsi']:.1f}) + ADX 약세({adx:.1f}) → 청산")
+                    r = self.orders.sell(ticker, reason=f"RSI 과매수 ({signals['rsi']:.1f}, ADX={adx:.1f})")
+                    if r:
+                        r["trigger"] = "RSI_OVERBOUGHT"
+                        results.append(r)
+                    continue
 
             # ─────────────────────────────────
             # 기존 익절선 도달 (전량 익절)
@@ -135,6 +181,21 @@ class PositionMonitor:
                 r = self.orders.sell(ticker, reason=f"Take Profit {change*100:+.1f}%")
                 if r:
                     r["trigger"] = "TAKE_PROFIT"
+                    results.append(r)
+                continue
+
+            # ─────────────────────────────────
+            # ATR 2차 안전장치 (최대 허용 손실 한도)
+            # ─────────────────────────────────
+            atr_sl = pos.get("atr_sl_price", 0)
+            if atr_sl > 0 and current <= atr_sl:
+                logger.critical(
+                    f"[ATR SL] {ticker} ATR 최대 손실 한도 이탈! "
+                    f"현재={current:,} <= ATR SL={atr_sl:,}"
+                )
+                r = self.orders.sell(ticker, reason=f"ATR 최대손실 한도 ({atr_sl:,} 이탈)")
+                if r:
+                    r["trigger"] = "ATR_STOP_LOSS"
                     results.append(r)
                 continue
 

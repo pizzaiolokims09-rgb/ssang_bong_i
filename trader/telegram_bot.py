@@ -75,12 +75,13 @@ class TelegramBot:
                     {"text": "/매매일지"}
                 ],
                 [
+                    {"text": "/긴급익절"},
                     {"text": "/비상청산"},
                     {"text": "/추가매수"}
                 ],
                 [
-                    {"text": "/비상정지 🚨"},
-                    {"text": "/재개시 ✅"}
+                    {"text": "/비상정지"},
+                    {"text": "/재개시"}
                 ]
             ],
             "resize_keyboard": True,

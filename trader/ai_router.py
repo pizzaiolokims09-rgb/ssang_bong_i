@@ -22,6 +22,7 @@ import requests
 from dotenv import load_dotenv
 
 from trader.signals import evaluate_smc_structure
+from trader.quant_indicators import wilder_atr
 
 load_dotenv()
 logger = logging.getLogger("ssangbong.ai_router")
@@ -323,11 +324,11 @@ class MultiAssetCouncil:
 [Track A 엔벨로프 발산 스나이핑 전용 지시]
 - 현재가가 엔벨로프 상단({env_upper:,}원)을 돌파한 '발산 영역'에 있는지 확인하세요.
 - 발산 영역에 있다면, 1분봉에서 거래량이 감소하며 눌림을 주다가 갑자기 거래량이 폭발(직전 20봉 평균 대비 2배 이상)하며 양봉을 뽑아내는 시점을 포착하세요.
-- 해당 거래량 폭발 양봉의 저점(Low)을 'trigger_candle_low'로 반환하세요. 이것이 절대 손절선(꼬리 손절)이 됩니다.
+- 1분봉 양봉의 저점(꼬리)을 손절선으로 잡으면 너무 타이트하여 휩소에 털릴 수 있습니다. 따라서 주어진 분봉 흐름을 파악하여 최근 '5분봉 기준 눌림목의 최저점'을 유추해 'trigger_candle_low'로 반환하세요.
 - 발산 영역이 아닌 종목은 Track A로 판정하지 마세요.
 
 [트랙 선택지]
-Track A (엔벨로프 발산 스나이핑): 일봉상 엔벨로프 상단 돌파(발산 영역) + 1분봉 거래량 폭발 양봉 출현 시. God Mode 즉시 시장가 매수, 5~7% 익절. 반드시 trigger_candle_low(해당 양봉 저점)를 반환할 것.
+Track A (엔벨로프 발산 스나이핑): 일봉상 엔벨로프 상단 돌파(발산 영역) + 1분봉 거래량 폭발 양봉 출현 시. God Mode 즉시 시장가 매수, 5~7% 익절. 반드시 trigger_candle_low(5분봉 기준 눌림목 저점)를 반환할 것.
 Track B (눌림목 스윙): 기준봉 대비 거래량 급감(10% 이하), 연속 음봉, 20일선 근접 시. 지정가 분할매수.
 Track C (종가 베팅): 15:00 이후, 20일 매물대 상향 돌파 중, 매수잔량 압도, 외인/기관 유입 시 종가 진입.
 Track D (세력주 매집): 52주 신저가 부근 하락 멈춤, PER 1배 이상, 유보율 200% 이상. 소량 분할 매수.
@@ -418,7 +419,10 @@ SKIP: 위 어느 트랙에도 해당하지 않는 경우.
             
         smc_pivot_low = smc_data.get("pivot_low", 0)
         
-        if smc_pivot_low > 0 and smc_pivot_low < current:
+        if track_code == "A":
+            # Track A는 1분봉 단타이므로 일봉 SMC가 아닌 trigger_candle_low를 동적 지지선으로 사용
+            dynamic_sl = int(trigger_candle_low * 0.995) if trigger_candle_low > 0 else 0
+        elif smc_pivot_low > 0 and smc_pivot_low < current:
             # SMC 지지선(직전 스윙 로우)을 동적 손절가로 채택 (0.5% 버퍼)
             dynamic_sl = int(smc_pivot_low * 0.995)
         else:
@@ -444,11 +448,17 @@ SKIP: 위 어느 트랙에도 해당하지 않는 경우.
                 # 4차 거미줄 타점(30%) 대비 -10% 하락
                 dynamic_sl = int(peak_200d * 0.27) if peak_200d > 0 else int(current * 0.90)
 
+        # ATR 기반 동적 TP/SL 계산 (2차 안전장치)
+        atr_value = wilder_atr(candles, 14) if candles else 0
+        atr_sl_price = int(final_entry_price - 2 * atr_value) if atr_value > 0 else 0
+        atr_tp_price = int(final_entry_price + 3 * atr_value) if atr_value > 0 else 0
+
         logger.info(f"[AI] {stock.get('name')} -> Track {track_code} "
                     f"({result.get('reason', '')[:50]}...) "
                     f"신뢰도={result.get('confidence', 0):.0%}"
                     f"{f' 꼬리손절={trigger_candle_low:,}' if trigger_candle_low else ''}"
                     f"{f' 동적손절={dynamic_sl:,}' if dynamic_sl else ''}"
+                    f"{f' ATR={atr_value:,.0f} SL={atr_sl_price:,} TP={atr_tp_price:,}' if atr_value else ''}"
                     f"{f' 200일고가={peak_200d:,}' if peak_200d else ''}")
 
         return {
@@ -464,6 +474,9 @@ SKIP: 위 어느 트랙에도 해당하지 않는 경우.
             "ma150": ma150,
             "ma200": ma200,
             "dynamic_sl_price": dynamic_sl,
+            "atr_value": atr_value,
+            "atr_sl_price": atr_sl_price,
+            "atr_tp_price": atr_tp_price,
         }
 
     # ──────────────────────────────────────────

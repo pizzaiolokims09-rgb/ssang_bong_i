@@ -472,11 +472,90 @@ D등급: 심각한 신뢰 훼손 (횡령/배임/반복적 주주 기만) → "RE
             "reason": result.get("reason", ""),
         }
 
+    # ══════════════════════════════════════════════
+    # 검증 #7: Fail-Close 최종 관문 (월스트리트 수석 트레이더 페르소나)
+    # 적용 대상: 전 트랙 (매수 직전 최종 검토)
+    # ══════════════════════════════════════════════
+    def fail_close_final_gate(self, stock_name: str, ticker: str, track: str,
+                              quant_summary: str = "") -> dict:
+        """
+        Fail-Close 최종 관문.
+        정량적 데이터(퀀트)가 매수 합격을 주더라도,
+        AI 에이전트가 마지막으로 검토하여 데이터에 모순이 있거나
+        변동성 리스크가 감지되면 무조건 거래를 차단(REJECT)합니다.
+
+        반환: {"verdict": "PASS|REJECT", "confidence": 0~100, "reason": "..."}
+        """
+        prompt = f"""[System Persona]
+당신은 월스트리트에서 20년 경력의 수석 트레이더(리스크 관리 전문가)입니다.
+당신의 유일한 임무는 아래 매수 신호를 최종 검토하여,
+'진짜 들어가도 되는지' 판단하는 것입니다.
+
+당신의 핵심 원칙:
+- 의심이 있으면 사지 않는다 (Fail-Close)
+- 데이터 간 모순이 있으면 사지 않는다
+- 확신이 70% 미만이면 사지 않는다
+- 100번의 기회 중 1번을 놓치더라도, 1번의 대손을 막는 것이 우선이다
+- 뉴스 감성(Sentiment)과 거시경제 환경을 반드시 고려하라
+
+[Quant 판단 요약]
+{quant_summary or '퀀트 데이터 없음'}
+
+[검토 대상]
+- 종목명: {stock_name}
+- 종목코드: {ticker}
+- 트랙: Track {track}
+
+[검토 항목]
+1. 거시경제 환경: 현재 금리/환율/VIX 방향이 이 종목에 역풍은 아닌지
+2. 뉴스 감성: 이 종목/섹터 관련 최신 뉴스가 부정적인지
+3. 데이터 모순 검증: Quant 판단에 논리적 모순이 있는지
+   (예: 거래량 폭발인데 하락중, RSI 과매수인데 매수 신호 등)
+4. 변동성 리스크: 이 종목이 굉장히 위험한 시점(실적발표 전, CB 전환 예정 등)인지
+
+[판정 기준]
+- 확신 70% 이상 + 모순/리스크 없음 → "PASS"
+- 확신 70% 미만 또는 모순/리스크 발견 → "REJECT"
+
+[출력 형식 (반드시 아래 JSON만 출력)]
+{{"verdict": "PASS", "confidence": 85, "reason": "..."}}"""
+
+        raw = self._call_gemini(prompt, use_pro=True)
+        if not raw:
+            logger.warning(f"[Fail-Close] AI 응답 실패 -> REJECT: {stock_name}")
+            return {"verdict": self.REJECT, "confidence": 0,
+                    "reason": "AI 응답 실패 (Fail-Close 원칙에 따라 REJECT)"}
+
+        result = self._parse_json(raw)
+        if not result:
+            return {"verdict": self.REJECT, "confidence": 0,
+                    "reason": f"파싱 실패: {raw[:300]}"}
+
+        verdict = result.get("verdict", "REJECT").upper()
+        confidence = result.get("confidence", 0)
+
+        # Fail-Close: 확신 70% 미만이면 무조건 REJECT
+        if confidence < 70:
+            verdict = self.REJECT
+            logger.warning(
+                f"[Fail-Close] {stock_name} 확신도 {confidence}% < 70% -> 강제 REJECT")
+
+        if verdict not in [self.PASS, self.REJECT]:
+            verdict = self.REJECT
+
+        logger.info(f"[Fail-Close] {stock_name} Track {track} -> {verdict} "
+                    f"(확신도={confidence}%)")
+        return {
+            "verdict": verdict,
+            "confidence": confidence,
+            "reason": result.get("reason", ""),
+        }
+
     # ══════════════════════════════════════════
     # 통합 게이트: 트랙별 필수 검증 자동 실행
     # ══════════════════════════════════════════
     def gate_check(self, stock_name: str, ticker: str, track: str,
-                   theme: str = "") -> dict:
+                   theme: str = "", quant_summary: str = "") -> dict:
         """
         Phase 2 라우팅 결과를 받아, 해당 트랙에 필요한 심층 검증을 자동 실행.
         run.py에서 매수 직전에 이 함수 하나만 호출하면 된다.
@@ -547,6 +626,18 @@ D등급: 심각한 신뢰 훼손 (횡령/배임/반복적 주주 기만) → "RE
         # 요약 생성
         check_names = list(checks.keys())
         summary = f"Phase 3 검증 완료 [{', '.join(check_names) or '해당없음'}] -> {final_verdict}"
+
+        # Fail-Close 최종 관문: 모든 검증 통과(PASS) 후에도 AI가 최종 검토
+        if final_verdict == self.PASS:
+            fail_close = self.fail_close_final_gate(
+                stock_name, ticker, track, quant_summary)
+            checks["fail_close"] = fail_close
+            if fail_close["verdict"] == self.REJECT:
+                final_verdict = self.REJECT
+                summary += f" -> Fail-Close REJECT (확신도={fail_close.get('confidence', 0)}%)"
+                logger.warning(
+                    f"[Gate] {stock_name} 퀀트 PASS였으나 Fail-Close에서 REJECT! "
+                    f"사유: {fail_close.get('reason', '')[:100]}")
 
         logger.info(f"[Gate] {stock_name} Track {track} -> {final_verdict} ({summary})")
         return {
