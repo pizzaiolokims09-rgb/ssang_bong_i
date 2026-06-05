@@ -17,6 +17,7 @@ import logging
 import re
 import time
 import requests
+import pandas as pd
 from bs4 import BeautifulSoup
 from typing import Optional
 from datetime import datetime
@@ -567,16 +568,21 @@ class BaseScreener:
     # ──────────────────────────────────────────────
     # Track B 전용: 눌림목 단기 스윙 스캔
     # ──────────────────────────────────────────────
-    def scan_track_b(self, candidates: list) -> list:
+    def scan_track_b(self, candidates: list, theme_tickers: list = None) -> list:
         """
-        영웅문 '눌림목 단기 스윙' 검색기 기준:
-        1) 거래량 급감: 당일 거래량 <= 전일 거래량의 50%
-        2) 연속 음봉: 최근 1봉 이상 close < open
-        3) MA20 근접: 현재가가 MA20의 120% 이내 && 현재가 > MA20
-        4) 정배열: MA5 >= MA20 >= MA60
+        [개조됨] 주도주 스윙 검색기 기준 (얕은 눌림목):
+        1) 거래량 감소: 당일 거래량 <= 전일 거래량의 70% (너무 빡빡한 50%에서 완화)
+        2) 5일선 ~ 10일선 근접: 현재가가 5일선 또는 10일선 부근에서 지지받는 형태
+        3) 정배열: 현재가 > MA20 및 MA20 >= MA60 (주도주 조건)
+        
+        테마주(theme_tickers)가 후보군에 있을 경우 가산점을 부여하거나 우선 필터링할 수 있도록
+        확장 가능성을 열어둡니다.
 
         반환: 조건 충족 종목 리스트
         """
+        if theme_tickers is None:
+            theme_tickers = []
+            
         results = []
         for stock in candidates:
             ticker = stock["ticker"]
@@ -593,40 +599,41 @@ class BaseScreener:
 
             # 이동평균 계산
             ma5  = sum(closes[:5]) / 5
+            ma10 = sum(closes[:10]) / 10
             ma20 = sum(closes[:20]) / 20
             ma60 = sum(closes[:60]) / 60
             current = stock["current"]
 
-            # 조건 1: 거래량 급감 (당일 <= 전일의 50%)
+            # 조건 1: 거래량 감소 (당일 <= 전일의 70%)
             if volumes[1] <= 0:
                 continue
             vol_ratio = volumes[0] / volumes[1]
-            if vol_ratio > 0.50:
+            if vol_ratio > 0.70:
                 continue
 
-            # 조건 2: 최근 1봉 이상 음봉
-            if daily[0]["close"] >= daily[0]["open"]:
+            # 조건 2: 5일선 ~ 10일선 사이 또는 5일선/10일선 부근 얕은 눌림목
+            # 현재가가 MA10의 98% 이상이고, MA5의 103% 이하인 밴드 안에 위치
+            if current < ma10 * 0.98 or current > ma5 * 1.03:
                 continue
 
-            # 조건 3: 현재가 > MA20 && 현재가 <= MA20 * 1.20 (20% 이내 근접)
-            if current <= ma20 or current > ma20 * 1.20:
-                continue
-
-            # 조건 4: 정배열 (MA5 >= MA20 >= MA60)
-            if not (ma5 >= ma20 >= ma60):
+            # 조건 3: 정배열 (현재가 > MA20 && MA20 >= MA60)
+            if current <= ma20 or ma20 < ma60:
                 continue
 
             stock_b = stock.copy()
             stock_b["track_hint"] = "B"
             stock_b["ma5"] = int(ma5)
+            stock_b["ma10"] = int(ma10)
             stock_b["ma20"] = int(ma20)
             stock_b["ma60"] = int(ma60)
             stock_b["vol_ratio"] = round(vol_ratio, 3)
+            stock_b["is_theme"] = ticker in theme_tickers
             results.append(stock_b)
 
             logger.info(
-                f"  📉 [Track B] {stock['name']}({ticker}) 눌림목 감지 "
-                f"거래량={vol_ratio:.1%} MA정배열({int(ma5)}≥{int(ma20)}≥{int(ma60)})"
+                f"  📉 [Track B] {stock['name']}({ticker}) 얕은 눌림 감지 "
+                f"(테마주={'O' if stock_b['is_theme'] else 'X'}) "
+                f"거래량={vol_ratio:.1%} MA5={int(ma5)} MA10={int(ma10)}"
             )
 
         logger.info(f"[Track B] 눌림목 스윙 후보: {len(results)}개")
@@ -637,33 +644,32 @@ class BaseScreener:
     # ──────────────────────────────────────────────
     def scan_track_c(self, candidates: list) -> list:
         """
-        영웅문 'ABC 수급 종가 배팅' 검색기 기준:
-        1) 거래량 70만주+ (Phase 1 100만 기준이므로 자동 충족)
-        2) 체결강도 40% 이상
-        3) 최근 5봉 내 전일 대비 거래량 50%+ 증가 이력 1회 이상
-
+        [개조됨] ABC 수급 종가 베팅 검색기 기준:
+        1) 최근 5일 내 수급 유입: 최근 5봉 내 전일 대비 거래량 50%+ 증가 이력 1회 이상
+        2) 5일선 지지: 현재가가 5일선 위에서 위치 (추세 유지)
+        3) 당일 거래량 축소: 당일 거래량이 전일 대비 크게 터지지 않고 쉬어가는 흐름 (전일 대비 120% 이하)
+        
         반환: 조건 충족 종목 리스트
         """
         results = []
         for stock in candidates:
             ticker = stock["ticker"]
+            current = stock["current"]
 
-            # 체결강도 조회 (실전 API)
-            time.sleep(0.05)
-            quote = self.kis.get_quote(ticker)
-            exec_strength = quote.get("execution_strength", 0)
-
-            # 조건 2: 체결강도 40% 이상
-            if exec_strength < 40.0:
-                continue
-
-            # 일봉 데이터로 거래량 급증 이력 확인
+            # 일봉 데이터로 거래량 급증 이력 및 MA5 확인
             time.sleep(0.05)
             daily = self.kis.get_daily_chart(ticker)
             if not daily or len(daily) < 6:
                 continue
 
-            # 조건 3: 최근 5봉 내 전일 대비 거래량 50%+ 증가 이력
+            closes = [c["close"] for c in daily]
+            ma5 = sum(closes[:5]) / 5
+
+            # 조건 2: 현재가가 5일선 위 (추세가 살아있는 종목)
+            if current < ma5:
+                continue
+
+            # 조건 1: 최근 5봉 내 전일 대비 거래량 50%+ 증가 이력 (수급 유입)
             vol_surge_found = False
             for i in range(min(5, len(daily) - 1)):
                 prev_vol = daily[i + 1]["volume"]
@@ -673,15 +679,22 @@ class BaseScreener:
 
             if not vol_surge_found:
                 continue
+                
+            # 조건 3: 당일은 쉬어가는 흐름 (당일 거래량 <= 전일 거래량의 120%)
+            # 만약 당일 이미 폭등/폭포수 거래량이 터졌다면 종가베팅으론 부적절
+            today_vol = daily[0]["volume"]
+            yest_vol = daily[1]["volume"]
+            if yest_vol > 0 and (today_vol / yest_vol) > 1.2:
+                continue
 
             stock_c = stock.copy()
             stock_c["track_hint"] = "C"
-            stock_c["execution_strength"] = exec_strength
+            stock_c["ma5"] = int(ma5)
             results.append(stock_c)
 
             logger.info(
                 f"  🌇 [Track C] {stock['name']}({ticker}) 종가 베팅 후보 "
-                f"체결강도={exec_strength:.1f}%"
+                f"(MA5지지, 최근수급확인, 거래량안정화)"
             )
 
         logger.info(f"[Track C] 종가 베팅 후보: {len(results)}개")
@@ -924,4 +937,94 @@ class BaseScreener:
             )
 
         logger.info(f"[Track F] 메가 트렌드 눌림목 후보: {len(results)}개")
+        return results
+
+    # ──────────────────────────────────────────────
+    # Track G 전용: CCI & MACD 더블 모멘텀 스윙
+    # ──────────────────────────────────────────────
+    def scan_track_g(self, candidates: list) -> list:
+        """
+        CCI(50) + MACD(12,26,9) 더블 모멘텀 스윙 스캔:
+        조건 A: 당일 일봉 종가 기준 CCI(50) 0선 상향 돌파
+        조건 B: 당일 일봉 종가 기준 MACD선 0선 상향 돌파
+        조건 C: 당일 거래대금 500억 이상
+
+        반환: [{..., "cci_value": float, "macd_value": float, "entry_day_low": int}, ...]
+        """
+        results = []
+        MIN_TRADE_AMOUNT = 50_000_000_000  # 500억원
+
+        for stock in candidates:
+            ticker = stock["ticker"]
+
+            # 조건 C 선행: 거래대금 500억 미달이면 즉시 스킵
+            trade_amount = stock.get("trade_amount", 0)
+            if trade_amount < MIN_TRADE_AMOUNT:
+                continue
+
+            time.sleep(0.05)
+            daily = self.kis.get_daily_chart(ticker, days=100)
+            if not daily or len(daily) < 60:
+                continue
+
+            # pandas DataFrame 구성 (최신이 맨 앞이므로 뒤집어서 시간순으로)
+            daily_sorted = list(reversed(daily))
+            df = pd.DataFrame(daily_sorted)
+
+            # 거래량 0인 날(공휴일/주말 결측치) 제거
+            df = df[df["volume"] > 0].reset_index(drop=True)
+            if len(df) < 60:
+                continue
+
+            # ── CCI(50) 계산 ──
+            typical_price = (df["high"] + df["low"] + df["close"]) / 3
+            tp_ma = typical_price.rolling(window=50).mean()
+            tp_md = typical_price.rolling(window=50).apply(
+                lambda x: (x - x.mean()).abs().mean(), raw=True
+            )
+            cci = (typical_price - tp_ma) / (0.015 * tp_md)
+
+            # ── MACD(12, 26, 9) 계산 ──
+            ema12 = df["close"].ewm(span=12, adjust=False).mean()
+            ema26 = df["close"].ewm(span=26, adjust=False).mean()
+            macd_line = ema12 - ema26
+
+            # 최근 2봉(당일, 전일) 값 추출
+            if len(cci) < 2 or pd.isna(cci.iloc[-1]) or pd.isna(cci.iloc[-2]):
+                continue
+            if pd.isna(macd_line.iloc[-1]) or pd.isna(macd_line.iloc[-2]):
+                continue
+
+            cci_today = float(cci.iloc[-1])
+            cci_yesterday = float(cci.iloc[-2])
+            macd_today = float(macd_line.iloc[-1])
+            macd_yesterday = float(macd_line.iloc[-2])
+
+            # 조건 A: CCI(50) 0선 상향 돌파 (전일 음수 → 당일 양수)
+            cci_cross_up = cci_yesterday < 0 and cci_today > 0
+            if not cci_cross_up:
+                continue
+
+            # 조건 B: MACD선 0선 상향 돌파 (전일 음수 → 당일 양수)
+            macd_cross_up = macd_yesterday < 0 and macd_today > 0
+            if not macd_cross_up:
+                continue
+
+            # 3박자 충족! 진입일 일봉 저가(절대 방어선용) 기록
+            entry_day_low = int(df["low"].iloc[-1])
+
+            stock_g = stock.copy()
+            stock_g["track_hint"] = "G"
+            stock_g["cci_value"] = round(cci_today, 2)
+            stock_g["macd_value"] = round(macd_today, 2)
+            stock_g["entry_day_low"] = entry_day_low
+            results.append(stock_g)
+
+            logger.info(
+                f"  📈 [Track G] {stock['name']}({ticker}) CCI&MACD 더블 모멘텀! "
+                f"CCI={cci_today:.1f} MACD={macd_today:.2f} "
+                f"거래대금={trade_amount//100_000_000}억 진입일저가={entry_day_low:,}"
+            )
+
+        logger.info(f"[Track G] CCI&MACD 더블 모멘텀 후보: {len(results)}개")
         return results

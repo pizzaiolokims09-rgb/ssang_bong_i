@@ -72,6 +72,68 @@ class PositionMonitor:
             # ─────────────────────────────────
             # 안전장치 #3: 절대 손절선 (Hard SL)
             # ─────────────────────────────────
+            # ── Track G 전용: Hold-to-TP 청산 로직 ──
+            # 고정 % 손절/익절 및 50% 분할 익절을 전면 무시하고,
+            # ATR 동적 손절 + 진입일 저가 방어선 + MACD 데드크로스로만 청산
+            if track == "G":
+                # 1) 절대 방어선: 진입일 일봉 저가 하향 이탈 시 즉시 시장가 손절
+                entry_day_low = pos.get("entry_day_low", 0)
+                if entry_day_low > 0 and current <= entry_day_low:
+                    logger.critical(
+                        f"[G-SL] {ticker} 진입일 저가 절대 방어선 이탈! "
+                        f"현재={current:,} <= 진입일저가={entry_day_low:,}"
+                    )
+                    r = self.orders.sell(ticker, reason=f"Track G 절대 방어선 (진입일저가 {entry_day_low:,} 이탈)")
+                    if r:
+                        r["trigger"] = "STOP_LOSS"
+                        results.append(r)
+                    continue
+
+                # 2) ATR 동적 손절
+                dynamic_sl = pos.get("dynamic_sl_price", 0)
+                if dynamic_sl > 0 and current <= dynamic_sl:
+                    logger.critical(
+                        f"[G-SL] {ticker} ATR 동적 손절 발동! "
+                        f"현재={current:,} <= 동적손절={dynamic_sl:,.0f}"
+                    )
+                    r = self.orders.sell(ticker, reason=f"Track G ATR 동적 손절 ({dynamic_sl:,} 이탈)")
+                    if r:
+                        r["trigger"] = "STOP_LOSS"
+                        results.append(r)
+                    continue
+
+                # 3) MACD 데드크로스 매도 트리거 (Hold-to-TP 핵심)
+                minute_candles = self.kis.get_minute_chart(ticker)
+                daily_cndls = daily_candles_cache.get(ticker)
+                if daily_cndls is None:
+                    daily_cndls = self.kis.get_daily_chart(ticker) or []
+                    daily_candles_cache[ticker] = daily_cndls
+
+                signals = get_sell_signals(minute_candles or [], daily_cndls)
+
+                if signals["panic_sell"]:
+                    logger.critical(f"[G-4T] {ticker} 패닉셀 감지! 즉시 청산")
+                    r = self.orders.sell(ticker, reason="Track G 패닉셀 (거래량 3배+ 폭발)")
+                    if r:
+                        r["trigger"] = "PANIC_SELL"
+                        results.append(r)
+                    continue
+
+                if signals["macd_bearish"]:
+                    logger.info(
+                        f"[G-4T] {ticker} MACD 데드크로스 매도! "
+                        f"Hist={signals['macd_histogram']:.2f}"
+                    )
+                    r = self.orders.sell(ticker, reason=f"Track G MACD 데드크로스 (Hist={signals['macd_histogram']:.2f})")
+                    if r:
+                        r["trigger"] = "MACD_SELL"
+                        results.append(r)
+                    continue
+
+                # Track G는 위 조건 외에는 홀딩 (Hold-to-TP)
+                continue
+
+            # ── 일반 트랙 (A~F) 손절 로직 ──
             # 동적 손절(Dynamic SL) 검사
             dynamic_sl = pos.get("dynamic_sl_price", 0)
             

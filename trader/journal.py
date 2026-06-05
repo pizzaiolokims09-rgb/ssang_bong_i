@@ -49,6 +49,15 @@ class TradeJournal:
                 max_loss_cond TEXT
             )
         ''')
+        
+        # ML 피처 컬럼 추가 (DB 마이그레이션)
+        ml_columns = ["vol_ratio", "env_diff", "bb_width", "rsi", "macd", "adx", "atr"]
+        for col in ml_columns:
+            try:
+                c.execute(f"ALTER TABLE trades ADD COLUMN {col} REAL")
+            except sqlite3.OperationalError:
+                pass # 이미 존재하는 컬럼
+                
         conn.commit()
         conn.close()
 
@@ -76,16 +85,31 @@ class TradeJournal:
 
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
+        
+        # ML Feature 파싱
+        qf = trade_data.get('quant_features', {})
+        v_vol = qf.get("vol_ratio", 0.0)
+        v_env = qf.get("env_diff", 0.0)
+        v_bb = qf.get("bb_width", 0.0)
+        v_rsi = qf.get("rsi", 50.0)
+        v_macd = qf.get("macd", 0.0)
+        v_adx = qf.get("adx", 0.0)
+        v_atr = qf.get("atr", 0.0)
+        
         c.execute('''
-            INSERT INTO trades (date, ticker, name, track, reason, entry_price, sell_price, quantity, pnl, return_pct, total_capital_pct, ai_review)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO trades (
+                date, ticker, name, track, reason, entry_price, sell_price, quantity, pnl, return_pct, total_capital_pct, ai_review,
+                vol_ratio, env_diff, bb_width, rsi, macd, adx, atr
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             trade_data['ticker'],
             trade_data.get('name', ''),
             trade_data['track'],
             trade_data.get('reason', ''),
-            entry, sell, trade_data['quantity'], pnl, return_pct, total_cap_pct, review
+            entry, sell, trade_data['quantity'], pnl, return_pct, total_cap_pct, review,
+            v_vol, v_env, v_bb, v_rsi, v_macd, v_adx, v_atr
         ))
         conn.commit()
         conn.close()
@@ -148,20 +172,29 @@ class TradeJournal:
             c.execute("SELECT * FROM trades ORDER BY id ASC LIMIT 10")
             old_trades = c.fetchall()
             
+            # ML 기반 데이터 수집 및 학습 (Hybrid)
+            ml_summary = self.train_ml_model()
+            
             # 분석용 데이터 문자열 구성
             trade_data_str = ""
             for t in old_trades:
                 trade_data_str += f"- [{t[3]}] Track {t[4]}, 수익: {t[10]:+.2f}%, 이유: {t[5]}, 복기: {t[12]}\n"
                 
             prompt = f"""
-            당신은 매매 시스템을 최적화하는 AI 코어입니다. 아래는 과거 10개의 매매 내역입니다.
+            당신은 매매 시스템을 최적화하는 하이브리드(AI+ML) 코어입니다.
+            
+            [머신러닝(Random Forest) 분석 결과]
+            {ml_summary if ml_summary else "ML 데이터 부족으로 생략됨"}
+            
+            [최근 10개의 텍스트 매매 내역]
             {trade_data_str}
             
-            이 데이터를 분석하여 봇의 승률을 높이기 위한 규칙을 도출하세요.
+            위의 객관적인 ML 분석 결과와 최근 매매 내역을 종합하여, 봇의 승률을 높이기 위한 하이브리드 규칙을 도출하세요.
+            **반드시 모든 응답은 한국어(Korean)로만 작성해야 합니다.**
             반드시 아래 JSON 형식으로 반환하세요.
             {{
-                "summary": "과거 10건에 대한 1문장 요약",
-                "max_profit_cond": "가장 수익이 좋았던 진입 패턴과 조건",
+                "summary": "ML 통계와 최근 10건에 대한 1문장 요약",
+                "max_profit_cond": "가장 수익이 좋았던 진입 패턴과 조건 (ML 중요도 참고)",
                 "max_loss_cond": "가장 손실이 컸거나 실패했던 패턴과 회피 방법"
             }}
             """
@@ -190,8 +223,9 @@ class TradeJournal:
                     analysis.get("max_loss_cond", "")
                 ))
                 
-                # 분석 끝난 10개는 삭제 (또는 아카이브 테이블로 이동 가능)
-                c.execute("DELETE FROM trades WHERE id IN (SELECT id FROM trades ORDER BY id ASC LIMIT 10)")
+                # 데이터 확보를 위해 DELETE 대신 최근 분석 시점 마킹으로 대체 가능.
+                # 현재는 최대 500개 유지 후 오래된 것 삭제
+                c.execute("DELETE FROM trades WHERE id NOT IN (SELECT id FROM trades ORDER BY id DESC LIMIT 500)")
                 conn.commit()
                 conn.close()
                 
@@ -204,3 +238,61 @@ class TradeJournal:
         
         conn.close()
         return None
+
+    def train_ml_model(self) -> str:
+        """
+        누적된 매매 데이터를 바탕으로 Random Forest 모델을 훈련하고, 
+        Feature Importance를 텍스트로 요약하여 반환합니다.
+        """
+        try:
+            import pandas as pd
+            from sklearn.ensemble import RandomForestClassifier
+            import joblib
+            import os
+            
+            conn = sqlite3.connect(self.db_path)
+            # ML 피처가 존재하는 데이터만 가져옴
+            query = "SELECT pnl, vol_ratio, env_diff, bb_width, rsi, macd, adx, atr FROM trades WHERE vol_ratio IS NOT NULL AND vol_ratio > 0"
+            df = pd.read_sql_query(query, conn)
+            conn.close()
+            
+            if len(df) < 10:
+                return "ML 모델 훈련에 필요한 데이터(최소 10건)가 부족합니다."
+                
+            # 타겟 라벨: 수익 > 0 이면 1 (승리), 아니면 0 (패배)
+            y = (df['pnl'] > 0).astype(int)
+            X = df.drop(columns=['pnl'])
+            
+            # 모델 훈련
+            model = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+            model.fit(X, y)
+            
+            # 모델 저장
+            os.makedirs("data", exist_ok=True)
+            joblib.dump(model, "data/ml_brain.pkl")
+            
+            # 훈련 정확도 및 Feature Importance 추출
+            acc = model.score(X, y)
+            importances = model.feature_importances_
+            feature_names = X.columns
+            
+            # 중요도 순 정렬
+            fi_df = pd.DataFrame({"feature": feature_names, "importance": importances})
+            fi_df = fi_df.sort_values(by="importance", ascending=False)
+            
+            top_features = []
+            for _, row in fi_df.head(3).iterrows():
+                top_features.append(f"{row['feature']}({row['importance']:.2f})")
+                
+            summary = (
+                f"[ML Random Forest 모델 학습 완료]\n"
+                f"- 누적 학습 데이터: {len(df)}건\n"
+                f"- 모델 정확도(Accuracy): {acc*100:.1f}%\n"
+                f"- 승패를 가른 핵심 지표 Top 3: {', '.join(top_features)}"
+            )
+            return summary
+            
+        except Exception as e:
+            logger.error(f"[Journal] ML 모델 훈련 실패: {e}")
+            return f"ML 훈련 에러: {e}"
+

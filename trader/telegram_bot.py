@@ -178,7 +178,18 @@ class TelegramBot:
 
         ticker = data.get("ticker", "?")
         name = data.get("name", "")
-        stock_label = f"{name} ({ticker})" if name else ticker
+        
+        # 이름이 없거나 티커와 동일할 경우 pykrx로 이름 조회
+        if not name or name == ticker:
+            try:
+                from pykrx import stock
+                krx_name = stock.get_market_ticker_name(ticker)
+                if krx_name:
+                    name = krx_name
+            except Exception:
+                pass
+
+        stock_label = f"{name} ({ticker})" if name and name != ticker else ticker
 
         msg = (
             f"{emoji} <b>매도 체결 ({trigger_label})</b>\n"
@@ -300,6 +311,12 @@ class TelegramBot:
                                     logger.error(f"[TG] 명령어 파라미터 매칭 에러 ({cmd}): {e2}")
                             except Exception as e:
                                 logger.error(f"[TG] 명령어 처리 에러 ({cmd}): {e}")
+                        else:
+                            self.send("⚠️ 알 수 없는 명령어입니다. 하단 메뉴를 이용해주세요.")
+                    elif text:
+                        # 일반 텍스트 입력 시 안내 메시지
+                        self.send("🤖 저는 정해진 명령어와 하단 메뉴 버튼으로만 동작합니다.\n자연어 대화는 지원하지 않으니 하단 메뉴를 이용해주세요!")
+
                 
                 # 2) 버튼 클릭 (Callback Query) 처리
                 elif "callback_query" in update:

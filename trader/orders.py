@@ -49,6 +49,7 @@ class OrderManager:
         # 상태 관리
         self.positions: Dict[str, dict] = {}      # {ticker: {entry_price, qty, track, step, ...}}
         self.pending_orders: Dict[str, dict] = {} # {ticker: {order_time, entry_price, step, ...}}
+        self.watchlist: Dict[str, dict] = {}      # {ticker: {name, track, reason, ...}}
         self.daily_pnl: float = 0.0                # 당일 실현 손익
         self.entry_cooldown: Dict[str, float] = {} # {ticker: last_entry_timestamp}
         self.sell_cooldown: Dict[str, float] = {}  # {ticker: last_sell_timestamp}
@@ -59,11 +60,13 @@ class OrderManager:
         self.positions_file = "data/positions.json"
         self.pending_file = "data/pending_orders.json"
         self.cooldown_file = "data/cooldowns.json"
+        self.watchlist_file = "data/watchlist.json"
         self.PENDING_TTL = 300  # 5분 (초)
         self.MAX_RETRY = 5
         self._load_positions()
         self._load_pending()
         self._load_cooldowns()
+        self._load_watchlist()
 
     def _load_positions(self):
         """저장된 포지션 로드"""
@@ -142,6 +145,56 @@ class OrderManager:
                 }, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"[Orders] 쿨다운 저장 실패: {e}")
+
+    def _load_watchlist(self):
+        """저장된 관심종목 로드"""
+        if os.path.exists(self.watchlist_file):
+            try:
+                import json
+                with open(self.watchlist_file, "r", encoding="utf-8") as f:
+                    self.watchlist = json.load(f)
+                if self.watchlist:
+                    logger.info(f"[Orders] 관심종목 {len(self.watchlist)}개 로드 완료")
+            except Exception as e:
+                logger.error(f"[Orders] 관심종목 로드 실패: {e}")
+
+    def _save_watchlist(self):
+        """관심종목 저장"""
+        try:
+            import json
+            os.makedirs("data", exist_ok=True)
+            with open(self.watchlist_file, "w", encoding="utf-8") as f:
+                json.dump(self.watchlist, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"[Orders] 관심종목 저장 실패: {e}")
+
+    def add_to_watchlist(self, ticker: str, name: str, route_result: dict):
+        """관심종목에 추가 (펀더멘탈 통과 후 매수 대기)"""
+        self.watchlist[ticker] = {
+            "name": name,
+            "track": route_result.get("track"),
+            "reason": route_result.get("reason", ""),
+            "confidence": route_result.get("confidence", 0.0),
+            "route_result": route_result,
+            "added_time": datetime.now().isoformat()
+        }
+        self._save_watchlist()
+        logger.info(f"[Watchlist] {name}({ticker}) 관심종목 추가 완료 (Track {route_result.get('track')})")
+
+    def remove_from_watchlist(self, ticker: str):
+        """관심종목에서 제거"""
+        if ticker in self.watchlist:
+            del self.watchlist[ticker]
+            self._save_watchlist()
+            logger.info(f"[Watchlist] {ticker} 관심종목에서 제거됨")
+
+    def clear_watchlist(self):
+        """관심종목 전체 초기화 (당일 매수 실패 시 장 마감 후 호출)"""
+        if self.watchlist:
+            count = len(self.watchlist)
+            self.watchlist.clear()
+            self._save_watchlist()
+            logger.info(f"[Watchlist] 관심종목 {count}개 일괄 초기화 완료")
 
     # ──────────────────────────────────────────
     # 안전장치 #2: Double Entry Lock (쿨타임)
@@ -270,6 +323,8 @@ class OrderManager:
                         sum(1 for p in self.pending_orders.values() if p["track"] == "E")
         track_f_count = sum(1 for p in self.positions.values() if p["track"] == "F") + \
                         sum(1 for p in self.pending_orders.values() if p["track"] == "F")
+        track_g_count = sum(1 for p in self.positions.values() if p["track"] == "G") + \
+                        sum(1 for p in self.pending_orders.values() if p["track"] == "G")
 
         if track in ["A", "C"] and short_count >= self.max_short_positions:
             logger.warning(f"[Order] 단기 포지션 한도({self.max_short_positions}) 도달 -> 진입 차단")
@@ -282,6 +337,9 @@ class OrderManager:
             return None
         if track == "F" and track_f_count >= 1:
             logger.warning(f"[Order] 메가트렌드(Track F) 포지션 한도(1) 도달 -> 진입 차단")
+            return None
+        if track == "G" and track_g_count >= 1:
+            logger.warning(f"[Order] CCI&MACD 스윙(Track G) 포지션 한도(1) 도달 -> 진입 차단")
             return None
 
         # 이미 보유 중이거나 대기 중인 종목
@@ -362,9 +420,11 @@ class OrderManager:
                     "peak_200d": route_result.get("peak_200d", 0),
                     "spider_levels": track_info.get("spider_levels", []),
                     "dynamic_sl_price": route_result.get("dynamic_sl_price", 0),
+                    "entry_day_low": route_result.get("entry_day_low", 0),
                     "atr_value": route_result.get("atr_value", 0),
                     "atr_sl_price": route_result.get("atr_sl_price", 0),
                     "atr_tp_price": route_result.get("atr_tp_price", 0),
+                    "quant_features": route_result.get("quant_features", {}),
                 }
                 self._save_positions()
                 logger.info(f"[Order] 1차 시장가 체결: {ticker} Track {track} qty={quantity} (비율 {target_ratio[0]*100}%)")
@@ -390,9 +450,11 @@ class OrderManager:
                     "trigger_candle_low": route_result.get("trigger_candle_low", 0),
                     "peak_200d": route_result.get("peak_200d", 0),
                     "dynamic_sl_price": route_result.get("dynamic_sl_price", 0),
+                    "entry_day_low": route_result.get("entry_day_low", 0),
                     "atr_value": route_result.get("atr_value", 0),
                     "atr_sl_price": route_result.get("atr_sl_price", 0),
                     "atr_tp_price": route_result.get("atr_tp_price", 0),
+                    "quant_features": route_result.get("quant_features", {}),
                 }
                 self._save_pending()
                 logger.info(f"[Order] 지정가 매수 대기: {ticker} Track {track} qty={quantity} price={entry_price:,} (TTL={self.PENDING_TTL}초)")
@@ -625,6 +687,7 @@ class OrderManager:
             "atr_value": pend.get("atr_value", 0),
             "atr_sl_price": pend.get("atr_sl_price", 0),
             "atr_tp_price": pend.get("atr_tp_price", 0),
+            "quant_features": pend.get("quant_features", {}),
         }
         del self.pending_orders[ticker]
         self._save_positions()

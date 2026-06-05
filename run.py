@@ -249,6 +249,17 @@ def main():
         daily_swing_candidates = pykrx_scanner.fetch_daily_swing_candidates(top_n=50)
         pykrx_fetched_today = True
 
+    # 미국장 연동 주도 테마 리서치 (기동 시 1회 실행)
+    daily_themes = fundamental.update_daily_themes()
+    if daily_themes and "briefing" in daily_themes:
+        theme_names = []
+        for t in daily_themes.get("themes", []):
+            theme_names.extend([s.get("name", s.get("ticker")) for s in t.get("kr_stocks", [])])
+        theme_names_str = ", ".join(theme_names) if theme_names else "없음"
+        telegram.send(f"🌍 <b>[글로벌 주도 테마 리서치 완료]</b>\n{daily_themes['briefing']}\n\n추출된 관련주: {theme_names_str}")
+    else:
+        logger.warning("[Theme] 일일 테마 데이터 로드 실패 또는 없음")
+
     # ──────────────────────────────────────
     # 메인 무한 루프
     # ──────────────────────────────────────
@@ -427,6 +438,9 @@ def main():
                             telegram.send(f"📋 장마감 정리 완료: {len(eod_results)}개 종목 매도")
                         else:
                             telegram.send("📋 장마감 점검 완료: 정리 대상 없음 (전 종목 홀드)")
+                            
+                        # 관심종목 일괄 초기화
+                        orders.clear_watchlist()
 
                 # 5) 점심정리 로직 제거됨 (사용자 요청)
 
@@ -441,6 +455,54 @@ def main():
 
             # 종가 베팅 시간 판별 (14:45 부터 15:20 마감 전까지)
             is_closing_time = (current_hour == 15 and current_minute >= 0) or (current_hour == 14 and current_minute >= 45)
+
+            # ─────── Watchlist ML Sniper 감시 ───────
+            def check_watchlist_sniper():
+                """관심종목을 감시하며 ML 승률 70% 도달 시 매수 격발"""
+                from trader.quant_indicators import get_ml_features
+                if not orders.watchlist:
+                    return
+                    
+                logger.info(f"[Sniper] 관심종목 {len(orders.watchlist)}개 감시 중...")
+                for tck in list(orders.watchlist.keys()):
+                    item = orders.watchlist[tck]
+                    name = item.get("name", tck)
+                    trk = item.get("track", "")
+                    route_res = item.get("route_result", {})
+                    
+                    # 현재가 등 데이터 조회
+                    cndls = kis.get_minute_chart(tck)
+                    d_cndls = kis.get_daily_chart(tck)
+                    
+                    if not cndls or not d_cndls:
+                        continue
+                        
+                    cur_price = cndls[0].get("close", 0)
+                    if cur_price <= 0:
+                        continue
+                        
+                    # 최신 피처값 추출
+                    features = get_ml_features(d_cndls, cndls)
+                    
+                    # ML 승률 게이트 (Watchlist는 70% 기준)
+                    ml_result = fundamental.ml_predict_gate(name, tck, features)
+                    prob = ml_result.get("confidence", 0)
+                    
+                    if prob >= 70:
+                        logger.info(f"[Sniper] 🎯 {name}({tck}) ML 승률 70% 돌파! ({prob:.1f}%) -> 매수 격발")
+                        route_res["entry_price"] = cur_price
+                        route_res["quant_features"] = features
+                        
+                        b_result = orders.buy(tck, route_res)
+                        if b_result:
+                            telegram.notify_buy(b_result)
+                            logger.info(f"[BUY] {name} Track {trk} Sniper 매수 완료!")
+                            
+                        orders.remove_from_watchlist(tck)
+                    else:
+                        logger.info(f"[Sniper] {name}({tck}) ML 승률 대기 중: {prob:.1f}%")
+                        
+            check_watchlist_sniper()
 
             logger.info(f"[Scan #{scan_count}] Phase 1 스캔 시작 ({now.strftime('%H:%M:%S')})")
 
@@ -667,7 +729,8 @@ def main():
 
             # Track B: 눌림목 스윙 (항시)
             try:
-                b_stocks = screener.scan_track_b(candidates[:10])
+                theme_tickers = daily_themes.get("all_tickers", []) if daily_themes else []
+                b_stocks = screener.scan_track_b(candidates[:10], theme_tickers=theme_tickers)
                 for s in b_stocks:
                     track_hints.setdefault(s["ticker"], []).append("B")
             except Exception as e:
@@ -706,6 +769,15 @@ def main():
                     track_hints.setdefault(s["ticker"], []).append("F")
             except Exception as e:
                 logger.warning(f"[PreFilter] Track F 스캔 에러: {e}")
+
+            # Track G: CCI & MACD 더블 모멘텀 스윙 (오후 12시 이후, 상위 15개)
+            if current_hour >= 12:
+                try:
+                    g_stocks = screener.scan_track_g(candidates[:15])
+                    for s in g_stocks:
+                        track_hints.setdefault(s["ticker"], []).append("G")
+                except Exception as e:
+                    logger.warning(f"[PreFilter] Track G 스캔 에러: {e}")
 
             if track_hints:
                 logger.info(f"[PreFilter] 트랙 후보 태깅: {track_hints}")
@@ -864,9 +936,17 @@ def main():
                     f"ATR: {route_result.get('atr_value', 0):,.0f}, "
                     f"진입가: {route_result.get('entry_price', 0):,}"
                 )
+                
+                # 트랙별 파라미터 분기 (C, D, F는 ML 예측 스킵 후 대기)
+                if track in ["C", "D", "F"]:
+                    q_features = None
+                else:
+                    q_features = route_result.get("quant_features", {})
+                    
                 gate = fundamental.gate_check(
                     stock.get("name", ticker), ticker, track,
-                    quant_summary=quant_summary
+                    quant_summary=quant_summary,
+                    quant_features=q_features
                 )
                 if gate["verdict"] == "REJECT":
                     logger.info(
@@ -880,7 +960,12 @@ def main():
                         f"Phase 3 비중 삭감. {gate.get('summary', '')[:100]}")
                     route_result["_budget_reduce"] = True  # orders.buy에서 50% 삭감 처리
 
-                # ─────── 주문 실행 ───────
+                # ─────── 주문 실행 또는 관심종목 보관 ───────
+                if track in ["C", "D", "F"]:
+                    orders.add_to_watchlist(ticker, stock['name'], route_result)
+                    telegram.send(f"👀 <b>[{track} 트랙 관심종목 추가]</b>\n종목: {stock['name']}\n펀더멘탈 검증 통과, ML 최적 타점 대기 중")
+                    continue
+                    
                 buy_result = orders.buy(ticker, route_result)
                 if buy_result:
                     telegram.notify_buy(buy_result)

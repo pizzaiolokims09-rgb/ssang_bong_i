@@ -398,3 +398,81 @@ def get_sell_signals(minute_candles: list, daily_candles: list) -> dict:
         result["minus_di"] = adx_data["minus_di"]
 
     return result
+
+# ──────────────────────────────────────────────
+# 머신러닝 피처 추출 (ML Feature Extraction)
+# ──────────────────────────────────────────────
+def get_ml_features(daily_candles: list, minute_candles: list) -> dict:
+    """
+    ML 모델 학습 및 예측을 위한 정량적 피처 추출
+    
+    피처 목록:
+      - vol_ratio: 최근 20일 평균 거래량 대비 당일 거래량 배수
+      - env_diff: 당일 종가와 20일선(엔벨롭 중심선) 간의 이격도 (%)
+      - bb_width: 볼린저 밴드 폭 (Upper - Lower) / Middle * 100
+      - rsi: RSI(14)
+      - macd: MACD 히스토그램
+      - adx: ADX(14)
+      - atr: ATR(14)
+    """
+    default = {
+        "vol_ratio": 0.0,
+        "env_diff": 0.0,
+        "bb_width": 0.0,
+        "rsi": 50.0,
+        "macd": 0.0,
+        "adx": 0.0,
+        "atr": 0.0
+    }
+    
+    filtered_daily = _filter_zero_volume(daily_candles)
+    if not filtered_daily or len(filtered_daily) < 20:
+        return default
+        
+    latest = filtered_daily[0]
+    current_close = latest["close"]
+    current_vol = latest.get("volume", 0)
+    
+    # 1. vol_ratio (거래량 배수)
+    vols_20 = [c.get("volume", 0) for c in filtered_daily[:20]]
+    avg_vol_20 = sum(vols_20) / len(vols_20) if vols_20 else 0
+    vol_ratio = (current_vol / avg_vol_20) if avg_vol_20 > 0 else 0.0
+    
+    # 2. env_diff (20일 이평선 이격도)
+    ma20 = calc_ma(filtered_daily, 20)
+    env_diff = ((current_close - ma20) / ma20 * 100.0) if ma20 > 0 else 0.0
+    
+    # 3. bb_width (볼린저 밴드 폭)
+    # 표준편차 계산
+    if ma20 > 0 and len(filtered_daily) >= 20:
+        import math
+        closes_20 = [c["close"] for c in filtered_daily[:20]]
+        variance = sum((c - ma20) ** 2 for c in closes_20) / 20
+        std_dev = math.sqrt(variance)
+        upper_bb = ma20 + (2 * std_dev)
+        lower_bb = ma20 - (2 * std_dev)
+        bb_width = ((upper_bb - lower_bb) / ma20 * 100.0)
+    else:
+        bb_width = 0.0
+        
+    # 4. rsi
+    rsi = wilder_rsi(filtered_daily, 14)
+    
+    # 5. macd histogram
+    macd_data = calc_macd(filtered_daily)
+    
+    # 6. adx
+    adx_data = wilder_adx(filtered_daily, 14)
+    
+    # 7. atr
+    atr = wilder_atr(filtered_daily, 14)
+    
+    return {
+        "vol_ratio": round(vol_ratio, 2),
+        "env_diff": round(env_diff, 2),
+        "bb_width": round(bb_width, 2),
+        "rsi": rsi,
+        "macd": macd_data["histogram"],
+        "adx": adx_data["adx"],
+        "atr": atr
+    }

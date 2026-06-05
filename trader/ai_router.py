@@ -84,6 +84,15 @@ TRACKS = {
         "hold_days": 90,
         "max_weight_pct": 0.20,   # 원금 대비 최대 20% 비중
     },
+    "G": {
+        "name": "CCI & MACD 더블 모멘텀 스윙",
+        "emoji": "📈",
+        "sl_pct": 0,       # 고정 % 손절 사용 안 함 (ATR 동적 손절 + 진입일 저가 방어선)
+        "tp_pct": 0,       # 고정 % 익절 사용 안 함 (MACD 데드크로스로 청산)
+        "order_type": "market",   # 스윙 비중 시장가 진입
+        "hold_days": 30,
+        "max_weight_pct": 0.10,   # 원금 대비 최대 10% 비중
+    },
     "SKIP": {
         "name": "진입 부적합",
         "emoji": "⛔",
@@ -98,7 +107,7 @@ TRACKS = {
 class MultiAssetCouncil:
     """
     Gemini AI 기반 매매 트랙 라우팅 엔진
-    Phase 1 통과 종목을 분석하여 Track A~F 중 하나를 결정
+    Phase 1 통과 종목을 분석하여 Track A~G 중 하나를 결정
     """
 
     def __init__(self, api_key: str = None):
@@ -250,6 +259,10 @@ class MultiAssetCouncil:
         daily_summary = self._summarize_daily(daily_candles)
         current_time = now.strftime("%H:%M")
 
+        # ML 피처 선제적 추출 (AI 판단 근거로 활용)
+        from trader.quant_indicators import get_ml_features
+        ml_features = get_ml_features(daily_candles, candles)
+
         # 엔벨로프 계산 (Period: 20, Percent: 12.5)
         env_upper, env_lower, ma20 = 0, 0, 0
         if daily_candles and len(daily_candles) >= 20:
@@ -321,6 +334,15 @@ class MultiAssetCouncil:
 - 엔벨로프 하단: {env_lower:,}원
 - 현재가 위치: {"⚡ 발산 영역 (상단 돌파) → Track A 후보" if in_expansion else "정상 범위"}
 
+[정통 퀀트 지표 (ML 기반 피처)]
+- 20일 평균 대비 당일 거래량: {ml_features['vol_ratio']:.2f}배
+- 20일선 이격도(Env Diff): {ml_features['env_diff']:.2f}%
+- 볼린저 밴드 폭(BB Width): {ml_features['bb_width']:.2f}%
+- RSI(14): {ml_features['rsi']:.1f}
+- MACD 히스토그램: {ml_features['macd']:.2f}
+- ADX(14): {ml_features['adx']:.1f}
+- ATR(14): {ml_features['atr']:.2f}
+
 [Track A 엔벨로프 발산 스나이핑 전용 지시]
 - 현재가가 엔벨로프 상단({env_upper:,}원)을 돌파한 '발산 영역'에 있는지 확인하세요.
 - 발산 영역에 있다면, 1분봉에서 거래량이 감소하며 눌림을 주다가 갑자기 거래량이 폭발(직전 20봉 평균 대비 2배 이상)하며 양봉을 뽑아내는 시점을 포착하세요.
@@ -334,10 +356,11 @@ Track C (종가 베팅): 15:00 이후, 20일 매물대 상향 돌파 중, 매수
 Track D (세력주 매집): 52주 신저가 부근 하락 멈춤, PER 1배 이상, 유보율 200% 이상. 소량 분할 매수.
 Track E (낙폭과대 폭락주 스나이핑): 최근 바닥 대비 300%+ 대시세 이력이 있으나 200일 최고가 대비 반토막(-50%+) 급락한 종목. 상장 1년 미만 신규 상장주는 제외. 200일 최고가(peak_200d)를 반드시 반환. 거미줄 4단계 지정가 분할매수(최고가×0.48/0.39/0.34/0.30).
 Track F (메가 트렌드 장기 눌림목): 최근 2~3개월 내 평소 대비 3배+ 거래량 폭발과 함께 50%+ 급등(시세 분출)한 이력이 있고, 이후 150일/200일 이동평균선까지 조정이 진행된 종목. 반도체/2차전지/로봇/전력/태양광 등 시대 중심 메가 트렌드 섹터 우량주에만 적용. God Mode 절대 금지 → 종가 기준 분할 매집. 150일선에서 1차 정찰병, 200일선 횡보 확인 시 비중 배팅. 200일선 하향 이탈 시 기계적 손절, +50%에서 1차 반익절 후 잔량 추세 추종 장기 홀딩. ma150과 ma200 값을 반드시 반환할 것.
+Track G (CCI & MACD 더블 모멘텀 스윙): 일봉 기준 CCI(50)와 MACD(12,26,9) 모두 동시에 0선을 상향 돌파한 종목. 추세 반전의 초입(무릎)을 잡아 길게 끌고 가는 스윙 전략. 거래대금 500억 이상 필수. 고정 % 손절/익절 없이 ATR 동적 손절과 MACD 데드크로스에 의해서만 청산(Hold-to-TP). 진입일 일봉 저가를 절대 방어선(entry_day_low)으로 반드시 반환할 것. 사전 필터에서 'G'가 태깅된 종목에만 부여 가능.
 SKIP: 위 어느 트랙에도 해당하지 않는 경우.
 
 [출력 형식 (반드시 아래 JSON만 출력)]
-{{"track": "A", "reason": "...", "confidence": 0.85, "entry_price": 14000, "sl_pct": 0.03, "tp_pct": 0.07, "trigger_candle_low": 13800, "peak_200d": 0, "ma150": 0, "ma200": 0}}
+{{"track": "A", "reason": "...", "confidence": 0.85, "entry_price": 14000, "sl_pct": 0.03, "tp_pct": 0.07, "trigger_candle_low": 13800, "peak_200d": 0, "ma150": 0, "ma200": 0, "entry_day_low": 0}}
 """
 
         # Thinking 모델로 정밀 판단
@@ -461,6 +484,9 @@ SKIP: 위 어느 트랙에도 해당하지 않는 경우.
                     f"{f' ATR={atr_value:,.0f} SL={atr_sl_price:,} TP={atr_tp_price:,}' if atr_value else ''}"
                     f"{f' 200일고가={peak_200d:,}' if peak_200d else ''}")
 
+        # Track G 전용: 진입일 일봉 저가 (절대 방어선)
+        entry_day_low = int(result.get("entry_day_low", 0))
+
         return {
             "name": stock.get("name", ""),
             "track": track_code,
@@ -473,10 +499,12 @@ SKIP: 위 어느 트랙에도 해당하지 않는 경우.
             "peak_200d": peak_200d,
             "ma150": ma150,
             "ma200": ma200,
+            "entry_day_low": entry_day_low,
             "dynamic_sl_price": dynamic_sl,
             "atr_value": atr_value,
             "atr_sl_price": atr_sl_price,
             "atr_tp_price": atr_tp_price,
+            "quant_features": ml_features,
         }
 
     # ──────────────────────────────────────────

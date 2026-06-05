@@ -71,6 +71,33 @@ class FundamentalScanner:
                 logger.info(f"[Fundamental] 폴백 모델({self.model_flash})로 재시도...")
         return None
 
+    def _call_gemini_with_search(self, prompt: str, use_pro: bool = True) -> Optional[str]:
+        """Gemini API 호출 (Google Search Grounding 활성화). 시황 리서치 전용."""
+        models = [self.model_pro, self.model_flash] if use_pro else [self.model_flash]
+
+        for model in models:
+            url = f"{self.base_url}/{model}:generateContent?key={self.api_key}"
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "tools": [{"googleSearch": {}}],
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "maxOutputTokens": 4096,
+                },
+            }
+            try:
+                resp = requests.post(url, json=payload, timeout=120)
+                resp.raise_for_status()
+                data = resp.json()
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                return text.strip()
+            except Exception as e:
+                logger.warning(f"[Fundamental] Gemini Search 호출 실패 ({model}): {e}")
+                if model == models[-1]:
+                    return None
+                logger.info(f"[Fundamental] 폴백 모델({self.model_flash})로 재시도...")
+        return None
+
     # ──────────────────────────────────────────
     # JSON 파싱 헬퍼 (ai_router.py 패턴 답습)
     # ──────────────────────────────────────────
@@ -552,10 +579,51 @@ D등급: 심각한 신뢰 훼손 (횡령/배임/반복적 주주 기만) → "RE
         }
 
     # ══════════════════════════════════════════
+    # 검증 #8: ML 기반 승률 예측 관문
+    # ══════════════════════════════════════════
+    def ml_predict_gate(self, stock_name: str, ticker: str, quant_features: dict) -> dict:
+        """머신러닝 모델을 통한 승률 예측 게이트"""
+        try:
+            import joblib
+            import pandas as pd
+            import os
+            
+            model_path = "data/ml_brain.pkl"
+            if not os.path.exists(model_path):
+                return {"verdict": self.PASS, "confidence": 50, "reason": "ML 모델 없음 (학습 대기 중)"}
+                
+            model = joblib.load(model_path)
+            
+            # 피처 스키마 맞추기
+            features = pd.DataFrame([{
+                "vol_ratio": quant_features.get("vol_ratio", 0.0),
+                "env_diff": quant_features.get("env_diff", 0.0),
+                "bb_width": quant_features.get("bb_width", 0.0),
+                "rsi": quant_features.get("rsi", 50.0),
+                "macd": quant_features.get("macd", 0.0),
+                "adx": quant_features.get("adx", 0.0),
+                "atr": quant_features.get("atr", 0.0)
+            }])
+            
+            # 클래스 1(승리)의 예측 확률
+            prob = model.predict_proba(features)[0][1] * 100
+            
+            if prob < 40:
+                logger.warning(f"[ML Gate] {stock_name} 승률 예측 {prob:.1f}% < 40% -> REJECT")
+                return {"verdict": self.REJECT, "confidence": prob, "reason": f"ML 승률 예측이 {prob:.1f}%로 너무 낮습니다."}
+            else:
+                logger.info(f"[ML Gate] {stock_name} 승률 예측 {prob:.1f}% -> PASS")
+                return {"verdict": self.PASS, "confidence": prob, "reason": f"ML 승률 예측: {prob:.1f}%"}
+                
+        except Exception as e:
+            logger.error(f"[ML Gate] 예측 중 에러: {e}")
+            return {"verdict": self.PASS, "confidence": 50, "reason": f"ML 에러: {e}"}
+
+    # ══════════════════════════════════════════
     # 통합 게이트: 트랙별 필수 검증 자동 실행
     # ══════════════════════════════════════════
     def gate_check(self, stock_name: str, ticker: str, track: str,
-                   theme: str = "", quant_summary: str = "") -> dict:
+                   theme: str = "", quant_summary: str = "", quant_features: dict = None) -> dict:
         """
         Phase 2 라우팅 결과를 받아, 해당 트랙에 필요한 심층 검증을 자동 실행.
         run.py에서 매수 직전에 이 함수 하나만 호출하면 된다.
@@ -623,6 +691,15 @@ D등급: 심각한 신뢰 훼손 (횡령/배임/반복적 주주 기만) → "RE
             if mega["verdict"] == self.REJECT:
                 final_verdict = self.REJECT
 
+        # ML 승률 예측 관문 (정량적 데이터가 있을 경우)
+        if quant_features:
+            ml_result = self.ml_predict_gate(stock_name, ticker, quant_features)
+            checks["ml_predict"] = ml_result
+            if ml_result["verdict"] == self.REJECT:
+                final_verdict = self.REJECT
+                # ML에서 REJECT된 경우 바로 리턴하여 불필요한 LLM 호출(또는 요약 생성) 방지 가능하나,
+                # 아래 요약에 반영하기 위해 계속 진행
+                
         # 요약 생성
         check_names = list(checks.keys())
         summary = f"Phase 3 검증 완료 [{', '.join(check_names) or '해당없음'}] -> {final_verdict}"
@@ -645,3 +722,81 @@ D등급: 심각한 신뢰 훼손 (횡령/배임/반복적 주주 기만) → "RE
             "checks": checks,
             "summary": summary,
         }
+
+    # ══════════════════════════════════════════
+    # 글로벌(미국장) 테마 분석 및 수혜주 매핑
+    # ══════════════════════════════════════════
+    def update_daily_themes(self) -> dict:
+        """
+        전일/금주 미국 증시 주도 섹터를 분석하여 한국 증시 관련 대장주를 추출.
+        결과를 data/daily_theme.json에 저장하고 반환한다.
+        """
+        import datetime
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        cache_path = "data/daily_theme.json"
+        
+        # 이미 오늘 분석을 마쳤으면 캐시 반환
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cache_data = json.load(f)
+                    if cache_data.get("date") == today:
+                        logger.info("[Theme] 금일 미국장 연동 테마 캐시를 로드했습니다.")
+                        return cache_data
+            except Exception as e:
+                logger.warning(f"[Theme] 캐시 로드 실패: {e}")
+        
+        logger.info("[Theme] 미국장 주도 섹터 및 한국장 수혜주 AI 리서치 시작...")
+        
+        prompt = f"""
+당신은 글로벌 매크로 및 주식 시장 분석 전문가입니다.
+오늘 날짜는 {today} 입니다.
+
+최근 1~2거래일 또는 이번 주 미국 증시(나스닥, S&P 500)에서 가장 강하게 상승한(돈이 몰린) 주도 섹터 3개를 선정하고, 각 섹터의 상승 사유를 설명해 주세요.
+그리고 해당 미국 주도 섹터들과 연동되어 **한국 증시(KOSPI/KOSDAQ)에서 수혜를 받을 수 있는 대표 대장주(종목코드 6자리 포함)**를 섹터별로 3~5개씩, 총 10~15개 추천해 주세요.
+시총이 너무 작거나(1000억 미만) 잡주는 제외하고, 시장의 수급이 몰릴 만한 주도주 위주로 선정하세요.
+
+반드시 아래 JSON 포맷으로만 응답하세요. (마크다운 백틱 제외, 오직 JSON만)
+{{
+    "date": "{today}",
+    "themes": [
+        {{
+            "us_sector": "섹터명 (예: AI 반도체)",
+            "reason": "상승 사유 요약 (1~2문장)",
+            "kr_stocks": [
+                {{"ticker": "000660", "name": "SK하이닉스"}},
+                {{"ticker": "042700", "name": "한미반도체"}}
+            ]
+        }}
+    ],
+    "briefing": "텔레그램으로 전송될 오늘의 글로벌 시황 및 추천 테마 요약 (3문장 이내)"
+}}
+"""
+        raw_resp = self._call_gemini_with_search(prompt, use_pro=True)
+        
+        if not raw_resp:
+            logger.error("[Theme] AI 시황 분석 응답 없음.")
+            return {}
+            
+        parsed = self._parse_json(raw_resp)
+        if not parsed or "themes" not in parsed:
+            logger.error(f"[Theme] 분석 결과 JSON 파싱 실패: {raw_resp[:200]}")
+            return {}
+            
+        # 모든 Ticker 수집 (편의를 위해 평탄화)
+        all_tickers = []
+        for theme in parsed.get("themes", []):
+            for stock in theme.get("kr_stocks", []):
+                all_tickers.append(stock["ticker"])
+        
+        parsed["all_tickers"] = list(set(all_tickers))
+        
+        # 캐시 저장
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(parsed, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            logger.warning(f"[Theme] 캐시 저장 실패: {e}")
+            
+        logger.info(f"[Theme] 리서치 완료. {len(parsed['all_tickers'])}개 주도주 후보 확보.")
+        return parsed
