@@ -177,7 +177,8 @@ class MultiAssetCouncil:
                 return "C"
 
         # 하락 종목 (-3% 이하) => 일단 SKIP
-        if change_pct <= -3:
+        # 단, 폭락주 스나이핑(Track E) 후보는 당일 급락 자체가 전제 조건이므로 면제
+        if change_pct <= -3 and "E" not in stock.get("track_hints", []):
             return "SKIP"
 
         # 분봉 데이터 부족 => SKIP
@@ -451,10 +452,16 @@ SKIP: 위 어느 트랙에도 해당하지 않는 경우.
             dynamic_sl = int(smc_pivot_low * 0.995)
         else:
             # 기존 로직 (SMC 계산 실패 시 백업)
-            if track_code in ["B", "D"]:
-                # MA20 (20일선)
+            if track_code == "B":
+                # MA20 (20일선) — B는 정배열 눌림목이라 진입가가 MA20 위에 있음
                 closes = [c["close"] for c in daily_candles[:20]] if len(daily_candles) >= 20 else []
                 dynamic_sl = int(sum(closes) / 20) if closes else int(current * 0.95)
+            elif track_code == "D":
+                # D는 검색 조건상 진입가가 MA20 '아래'이므로 MA20을 손절로 쓰면
+                # 진입 즉시 손절됨 → 최근 20일 최저가 기반 손절로 교체
+                recent_lows = [c["low"] for c in daily_candles[:20]] if daily_candles else []
+                low_base = min(recent_lows) if recent_lows else 0
+                dynamic_sl = int(low_base * 0.99) if 0 < low_base < current else int(current * 0.95)
             elif track_code == "C":
                 # 당일 저가
                 dynamic_sl = int(daily_candles[0]["low"]) if daily_candles else int(current * 0.95)
@@ -472,10 +479,22 @@ SKIP: 위 어느 트랙에도 해당하지 않는 경우.
                 # 4차 거미줄 타점(30%) 대비 -10% 하락
                 dynamic_sl = int(peak_200d * 0.27) if peak_200d > 0 else int(current * 0.90)
 
+        # 공통 안전장치: 동적 손절가는 반드시 현재가 아래에 있어야 한다
+        # (Track D처럼 진입가가 MA20 아래인 경우 폴백 손절가가 현재가 위에 놓여
+        #  진입 직후 즉시 손절되는 결함 방지)
+        if current > 0 and dynamic_sl >= current:
+            dynamic_sl = int(current * 0.95)
+
         # ATR 기반 동적 TP/SL 계산 (2차 안전장치)
-        atr_value = wilder_atr(candles, 14) if candles else 0
+        # '최대 허용 손실 한도'이므로 반드시 일봉 ATR로 산출한다.
+        # 1분봉 ATR로 계산하면 -0.2~-0.6%에 박혀 1차 동적 손절(-2~-5%)보다
+        # 타이트해지고, 휩쏘 손절(2026-06-01 RISE -0.30% 사례)의 원인이 된다.
+        atr_value = wilder_atr(daily_candles, 14) if daily_candles else 0
         atr_sl_price = int(final_entry_price - 2 * atr_value) if atr_value > 0 else 0
         atr_tp_price = int(final_entry_price + 3 * atr_value) if atr_value > 0 else 0
+        # 2차 한도는 항상 1차 동적 손절보다 아래(더 넓은 방어선)에 위치해야 한다
+        if atr_sl_price > 0 and dynamic_sl > 0 and atr_sl_price >= dynamic_sl:
+            atr_sl_price = int(dynamic_sl * 0.99)
 
         logger.info(f"[AI] {stock.get('name')} -> Track {track_code} "
                     f"({result.get('reason', '')[:50]}...) "

@@ -42,7 +42,7 @@ logger = logging.getLogger("ssangbong.main")
 def main():
     """메인 실행 함수"""
     from trader.kis_client import KISClient
-    from trader.signals import BaseScreener, detect_volume_spike, aggregate_5m_candles, find_5m_pivot_low, calculate_envelope, calculate_bb_ema, evaluate_smc_structure, calculate_vwap, calculate_atr
+    from trader.signals import BaseScreener, detect_volume_spike, aggregate_5m_candles, find_5m_pivot_low, calculate_envelope, calculate_bb_ema, evaluate_smc_structure, calculate_vwap, calculate_atr, _is_excluded_name
     from trader.quant_indicators import get_ml_features
     from trader.ai_router import MultiAssetCouncil, TRACKS, volume_confirm_filter
     from trader.orders import OrderManager
@@ -271,6 +271,11 @@ def main():
     # (동일 주도주를 60초마다 Gemini Pro로 재분석하던 비용/지연 낭비 차단)
     ai_skip_cache = {}
     AI_SKIP_TTL = 900  # 15분 (초)
+
+    # B/F 전용 수급주 유니버스 캐시 (pykrx 기관/외인 순매수 상위, 5분 갱신)
+    # 눌림목(B)/장기 눌림(F)은 '오늘 조용한 종목'이라 거래량 상위 유니버스에
+    # 구조적으로 잡히지 않으므로 독립 유니버스가 필요하다.
+    swing_universe_cache = {"ts": 0.0, "stocks": []}
     
     BOT_START_TIME = time.time()
 
@@ -279,6 +284,42 @@ def main():
     # 일일 큐레이션 상태 초기화
     pykrx_fetched_today = False
     daily_swing_candidates = []
+
+    def get_swing_universe() -> list:
+        """pykrx 기관/외인 순매수 상위 종목을 B/F 전용 유니버스로 구성 (5분 캐시).
+        candidates와 동일한 dict 형태로 반환하여 트랙 스캐너에 바로 투입 가능."""
+        if time.time() - swing_universe_cache["ts"] < 300:
+            return swing_universe_cache["stocks"]
+
+        stocks = []
+        for t in daily_swing_candidates[:40]:
+            quote = kis.get_quote(t)
+            time.sleep(0.05)
+            cur = quote.get("current", 0)
+            if cur <= 0:
+                continue
+            nm = quote.get("name", t)
+            if _is_excluded_name(nm):
+                continue
+            # 최소 유동성: 당일 거래대금 10억 이상
+            if quote.get("trade_amount", 0) < 1_000_000_000:
+                continue
+            stocks.append({
+                "ticker":       t,
+                "name":         nm,
+                "current":      cur,
+                "volume":       quote.get("volume", 0),
+                "trade_amount": quote.get("trade_amount", 0),
+                "market_cap":   quote.get("market_cap", 0),
+                "change_pct":   quote.get("change_pct", 0),
+                "exec_strength": quote.get("execution_strength", 0),
+            })
+
+        swing_universe_cache["ts"] = time.time()
+        swing_universe_cache["stocks"] = stocks
+        if stocks:
+            logger.info(f"[SwingUniverse] pykrx 수급주 유니버스 {len(stocks)}개 갱신")
+        return stocks
     
     # 기동 시각이 장중(09:00~15:30)이거나, 16시 이전이면 즉시 1회 스캔 (캐싱)
     now_hour = datetime.now().hour
@@ -289,9 +330,15 @@ def main():
 
     # 미국장 연동 주도 테마 리서치 (기동 시 1회 실행)
     daily_themes = fundamental.update_daily_themes()
+    theme_map = {}  # {ticker: 테마명} — Phase 3 세그먼트 검증 및 분석 우선순위에 사용
     if daily_themes and "briefing" in daily_themes:
         theme_names = []
         for t in daily_themes.get("themes", []):
+            sector_name = t.get("us_sector", "")
+            for s in t.get("kr_stocks", []):
+                tk = s.get("ticker", "")
+                if tk:
+                    theme_map[tk] = sector_name
             theme_names.extend([s.get("name", s.get("ticker")) for s in t.get("kr_stocks", [])])
         theme_names_str = ", ".join(theme_names) if theme_names else "없음"
         telegram.send(f"🌍 <b>[글로벌 주도 테마 리서치 완료]</b>\n{daily_themes['briefing']}\n\n추출된 관련주: {theme_names_str}")
@@ -552,6 +599,23 @@ def main():
                         fire = target_entry > 0 and cur_price <= target_entry * 1.01
                         wait_reason = f"진입가 대기 중 (목표 {target_entry:,} / 현재 {cur_price:,})"
 
+                    # 종가베팅(C)은 격발 직전 재검증: 아침에 담긴 종목이
+                    # 오후에 망가졌을 수 있으므로 MA5 지지/체결강도/약세 여부 확인
+                    if fire and trk == "C":
+                        closes5 = [c["close"] for c in d_cndls[:5]]
+                        ma5_w = sum(closes5) / len(closes5) if closes5 else 0
+                        q_w = kis.get_quote(tck)
+                        es_w = q_w.get("execution_strength", 0)
+                        prev_close_w = d_cndls[1]["close"] if len(d_cndls) > 1 else 0
+                        if (ma5_w > 0 and cur_price < ma5_w) \
+                                or (0 < es_w < 100) \
+                                or (prev_close_w > 0 and cur_price < prev_close_w):
+                            fire = False
+                            wait_reason = (
+                                f"종배 재검증 실패 (MA5={ma5_w:,.0f} "
+                                f"체결강도={es_w:.0f} 전일종가={prev_close_w:,})"
+                            )
+
                     if fire:
                         logger.info(f"[Sniper] 🎯 {name}({tck}) 매수 조건 충족! (ML {prob:.1f}%, 모델={'O' if has_ml_model else 'X'}) -> 매수 격발")
                         route_res["entry_price"] = cur_price
@@ -758,6 +822,26 @@ def main():
                         ai_skip_cache[p_ticker] = current_time
                         continue
 
+                    # AI가 다른 트랙(B/G 등)으로 판정한 종목을 단타 손절폭으로
+                    # 진입하지 않는다 → Phase 2 경로에서 해당 트랙으로 재검토
+                    if route_result["track"] != "A":
+                        logger.info(
+                            f"  ↪️ [AI 검증] {p_stock['name']} AI 판정 Track {route_result['track']} "
+                            f"→ 단타(A) 진입 보류 (Phase 2 경로에서 재검토)"
+                        )
+                        continue
+
+                    # 매뉴얼 원칙: Track A는 엔벨로프(20, 12.5%) 발산 영역 필수
+                    env_p = calculate_envelope(daily_candles_p)
+                    env_upper_p = env_p.get("env_upper", 0)
+                    if not (p_stock["current"] > env_upper_p > 0):
+                        logger.info(
+                            f"  🚫 [엔벨로프] {p_stock['name']} 발산 영역 아님 "
+                            f"(현재가={p_stock['current']:,} ≤ 상단={env_upper_p:,}) → Track A 부적합"
+                        )
+                        ai_skip_cache[p_ticker] = current_time
+                        continue
+
                     logger.info(
                         f"  ✅ [AI 검증] {p_stock['name']} Track {route_result['track']} "
                         f"승인! 신뢰도={route_result['confidence']:.0%}"
@@ -832,10 +916,17 @@ def main():
             # 각 트랙의 영웅문 검색기 정량 조건을 미리 검증하여 AI 참고 정보로 제공
             track_hints = {}  # {ticker: ["B", "C", ...]}
 
-            # Track B: 눌림목 스윙 (항시)
+            # B/F 독립 유니버스 (pykrx 수급주) — 거래량 상위에 안 잡히는 눌림목 후보 보강
+            swing_stocks = get_swing_universe()
+            cand_tickers_top = {c["ticker"] for c in candidates[:10]}
+            swing_only = [s for s in swing_stocks if s["ticker"] not in cand_tickers_top]
+            swing_by_ticker = {s["ticker"]: s for s in swing_only}
+
+            # Track B: 눌림목 스윙 (항시, 거래량 상위 10개 + 수급주 유니버스)
             try:
                 theme_tickers = daily_themes.get("all_tickers", []) if daily_themes else []
-                b_stocks = screener.scan_track_b(candidates[:10], theme_tickers=theme_tickers)
+                b_pool = (candidates[:10] + swing_only)[:25]
+                b_stocks = screener.scan_track_b(b_pool, theme_tickers=theme_tickers)
                 for s in b_stocks:
                     track_hints.setdefault(s["ticker"], []).append("B")
             except Exception as e:
@@ -867,16 +958,18 @@ def main():
             except Exception as e:
                 logger.warning(f"[PreFilter] Track E 스캔 에러: {e}")
 
-            # Track F: 메가 트렌드 장기 눌림목 (항시, 상위 10개)
+            # Track F: 메가 트렌드 장기 눌림목 (항시, 상위 10개 + 수급주 유니버스)
             try:
-                f_stocks = screener.scan_track_f(candidates[:10])
+                f_pool = (candidates[:10] + swing_only)[:15]
+                f_stocks = screener.scan_track_f(f_pool)
                 for s in f_stocks:
                     track_hints.setdefault(s["ticker"], []).append("F")
             except Exception as e:
                 logger.warning(f"[PreFilter] Track F 스캔 에러: {e}")
 
-            # Track G: CCI & MACD 더블 모멘텀 스윙 (오후 12시 이후, 상위 15개)
-            if current_hour >= 12:
+            # Track G: CCI & MACD 더블 모멘텀 스윙 (14:30 이후, 상위 15개)
+            # 당일 일봉이 거의 완성된 시점에 판정해 장중 가짜 크로스(리페인트) 방지
+            if (current_hour == 14 and current_minute >= 30) or current_hour == 15:
                 try:
                     g_stocks = screener.scan_track_g(candidates[:15])
                     for s in g_stocks:
@@ -888,10 +981,14 @@ def main():
                 logger.info(f"[PreFilter] 트랙 후보 태깅: {track_hints}")
 
             # ─────── Phase 2: AI Routing ───────
-            # 상위 5개 + 트랙 사전필터(B~G)에 태깅된 6~15위 종목까지 분석
-            # (태깅만 해놓고 AI 라우팅을 안 하면 해당 트랙 진입 기회가 통째로 사라짐)
+            # 상위 5개 + 트랙 사전필터(B~G)에 태깅된 6~15위 종목 + 수급주 유니버스에서
+            # 태깅된 종목까지 분석 (태깅만 해놓고 라우팅을 안 하면 진입 기회가 사라짐)
             hinted_extra = [s for s in candidates[5:15] if s["ticker"] in track_hints]
-            analysis_targets = candidates[:5] + hinted_extra[:5]
+            swing_hinted = [s for t, s in swing_by_ticker.items() if t in track_hints]
+            analysis_targets = candidates[:5] + hinted_extra[:5] + swing_hinted[:3]
+
+            # 글로벌 테마 관련주 우선 분석 (수급이 몰릴 확률이 높은 종목부터)
+            analysis_targets.sort(key=lambda s: 0 if s["ticker"] in theme_map else 1)
 
             for stock in analysis_targets:
                 ticker = stock["ticker"]
@@ -923,10 +1020,9 @@ def main():
                 # API 과부하 방지
                 time.sleep(0.5)
 
-                # 안전장치 #1: 볼륨 확증 필터
-                if not volume_confirm_filter(candles):
-                    logger.info(f"[Scan] {stock['name']} 볼륨 확증 미달 -> 패스")
-                    continue
+                # 볼륨 확증 필터는 트랙 판정 후 돌파형(A/C)에만 적용한다.
+                # (눌림목 B / 매집 D / 장기 F는 '거래량이 마른' 상태가 전제라
+                #  사전 일괄 적용 시 해당 트랙 후보가 구조적으로 전멸함)
 
                 # 사전 필터 결과를 AI에 참고 정보로 전달
                 stock["track_hints"] = track_hints.get(ticker, [])
@@ -991,6 +1087,11 @@ def main():
                                           f"SKIP: {route_result.get('reason', '')[:100]}",
                                           stock.get("current", 0),
                                           route_result.get("quant_features", {}))
+                    continue
+
+                # 안전장치 #1: 볼륨 확증 필터 (돌파형 트랙 A/C에만 적용)
+                if route_result["track"] in ["A", "C"] and not volume_confirm_filter(candles):
+                    logger.info(f"[Scan] {stock['name']} 볼륨 확증 미달 (Track {route_result['track']}) -> 패스")
                     continue
 
                 # 종가 베팅 시간이 아닌데 Track C로 판정되면 건너뛰기
@@ -1065,6 +1166,7 @@ def main():
                     
                 gate = fundamental.gate_check(
                     stock.get("name", ticker), ticker, track,
+                    theme=theme_map.get(ticker, ""),  # 테마 종목이면 세그먼트 팩트체크 가동
                     quant_summary=quant_summary,
                     quant_features=q_features
                 )

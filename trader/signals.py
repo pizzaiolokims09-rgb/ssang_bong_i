@@ -60,6 +60,16 @@ def _is_valid_ticker(ticker: str) -> bool:
     return bool(re.match(r"^\d{6}$", ticker))
 
 
+def _projected_full_day_volume(today_volume: float) -> float:
+    """장중 누적 거래량을 하루치(09:00~15:30, 390분)로 환산.
+    '당일 거래량 vs 전일 거래량' 비교는 오전에 당일 누적이 작아
+    조건이 무조건 통과되는 왜곡이 있으므로 반드시 환산 후 비교한다."""
+    now = datetime.now()
+    elapsed = (now.hour - 9) * 60 + now.minute
+    elapsed = max(5, min(elapsed, 390))  # 개장 직후 과대 환산 방지 (최소 5분)
+    return today_volume * (390.0 / elapsed)
+
+
 def _get_naver_volume_tickers() -> list:
     """네이버 금융 거래량 상위 티커 크롤링 (코스피+코스닥)"""
     tickers = []
@@ -605,10 +615,10 @@ class BaseScreener:
             ma60 = sum(closes[:60]) / 60
             current = stock["current"]
 
-            # 조건 1: 거래량 감소 (당일 <= 전일의 70%)
+            # 조건 1: 거래량 감소 (당일 하루치 환산 <= 전일의 70%)
             if volumes[1] <= 0:
                 continue
-            vol_ratio = volumes[0] / volumes[1]
+            vol_ratio = _projected_full_day_volume(volumes[0]) / volumes[1]
             if vol_ratio > 0.70:
                 continue
 
@@ -687,11 +697,11 @@ class BaseScreener:
             if not vol_surge_found:
                 continue
                 
-            # 조건 3: 당일은 쉬어가는 흐름 (당일 거래량 <= 전일 거래량의 120%)
+            # 조건 3: 당일은 쉬어가는 흐름 (당일 하루치 환산 거래량 <= 전일의 120%)
             # 만약 당일 이미 폭등/폭포수 거래량이 터졌다면 종가베팅으론 부적절
             today_vol = daily[0]["volume"]
             yest_vol = daily[1]["volume"]
-            if yest_vol > 0 and (today_vol / yest_vol) > 1.2:
+            if yest_vol > 0 and (_projected_full_day_volume(today_vol) / yest_vol) > 1.2:
                 continue
 
             stock_c = stock.copy()
@@ -1008,7 +1018,8 @@ class BaseScreener:
             macd_yesterday = float(macd_line.iloc[-2])
 
             # 조건 A: CCI(50) 0선 상향 돌파 (전일 음수 → 당일 양수)
-            cci_cross_up = cci_yesterday < 0 and cci_today > 0
+            # 0선을 '겨우' 넘은 크로스는 종가까지 되돌릴 수 있으므로 마진(+10) 요구
+            cci_cross_up = cci_yesterday < 0 and cci_today > 10
             if not cci_cross_up:
                 continue
 

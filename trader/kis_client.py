@@ -270,19 +270,8 @@ class KISClient:
                 continue
         return candles
 
-    def get_daily_chart(self, ticker: str, start_date: str = "", end_date: str = "",
-                        days: int = 90) -> list:
-        if not end_date:
-            end_date = datetime.now().strftime("%Y%m%d")
-        if not start_date:
-            start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
-
-        # 캐시 확인 (TTL 3분)
-        cache_key = (ticker, start_date, end_date)
-        hit = self._daily_cache.get(cache_key)
-        if hit and time.time() - hit[0] < self._daily_cache_ttl:
-            return hit[1]
-
+    def _fetch_daily_window(self, ticker: str, start_date: str, end_date: str) -> list:
+        """일봉 1회 조회 (KIS API는 1회 최대 100건 반환)"""
         result = self._safe_request(
             "GET",
             f"{self.real_base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
@@ -312,6 +301,44 @@ class KISClient:
                 })
             except (ValueError, TypeError):
                 continue
+        return candles
+
+    def get_daily_chart(self, ticker: str, start_date: str = "", end_date: str = "",
+                        days: int = 90) -> list:
+        """일봉 조회 (최신이 앞). KIS API의 1회 100건 한계를 페이지네이션으로 극복.
+        Track E(250거래일+)/F(200거래일+) 장기 스캔이 이 페이지네이션에 의존한다."""
+        if not end_date:
+            end_date = datetime.now().strftime("%Y%m%d")
+        if not start_date:
+            start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+
+        # 캐시 확인 (TTL 3분)
+        cache_key = (ticker, start_date, end_date)
+        hit = self._daily_cache.get(cache_key)
+        if hit and time.time() - hit[0] < self._daily_cache_ttl:
+            return hit[1]
+
+        candles = []
+        seen_dates = set()
+        cur_end = end_date
+        for _ in range(5):  # 최대 5페이지 = 약 500거래일
+            batch = self._fetch_daily_window(ticker, start_date, cur_end)
+            if not batch:
+                break
+            for c in batch:
+                if c["date"] and c["date"] not in seen_dates:
+                    seen_dates.add(c["date"])
+                    candles.append(c)
+            if len(batch) < 100:
+                break  # 요청 범위 내 데이터를 모두 수신함
+            oldest = batch[-1].get("date", "")
+            if not oldest or oldest <= start_date:
+                break
+            try:
+                cur_end = (datetime.strptime(oldest, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+            except ValueError:
+                break
+            time.sleep(0.05)  # KIS 초당 호출 제한 준수
 
         if candles:
             # 캐시 무한 증식 방지 (500개 초과 시 통째로 비움)

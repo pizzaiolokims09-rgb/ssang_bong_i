@@ -40,18 +40,33 @@ class PositionMonitor:
                 continue
 
             # ─────────────────────────────────
-            # 상한가 즉시 매도 (전 트랙 공통)
+            # 상한가 대응 (전 트랙 공통)
+            # 잠김(매수잔량 압도) 상태면 익일 갭 기대값이 높으므로 보유,
+            # 풀리거나 잠김이 약하면 즉시 매도
             # ─────────────────────────────────
             prev_close = quote.get("prev_close", 0)
             if prev_close > 0:
                 upper_limit_pct = (current - prev_close) / prev_close
                 if upper_limit_pct >= 0.295:  # 29.5% 이상 = 상한가 도달
                     name = pos.get("name", ticker)
+                    ob = self.kis.get_orderbook(ticker)
+                    bid_ratio = ob.get("bid_ask_ratio", 0)
+                    if bid_ratio >= 5:
+                        # 상한가 잠김: 매수잔량이 매도잔량을 압도 → 보유 유지
+                        if not pos.get("limit_up_hold_logged"):
+                            pos["limit_up_hold_logged"] = True
+                            self.orders._save_positions()
+                            logger.info(
+                                f"[UPPER LIMIT] {name}({ticker}) 상한가 잠김 "
+                                f"(매수/매도 잔량 {bid_ratio:.1f}배) → 익일 갭 노리고 보유 유지"
+                            )
+                        continue
                     logger.info(
-                        f"[UPPER LIMIT] {name}({ticker}) 상한가 도달! "
+                        f"[UPPER LIMIT] {name}({ticker}) 상한가 풀림/약한 잠김 "
+                        f"(잔량비 {bid_ratio:.1f}배) → 매도 "
                         f"전일종가={prev_close:,} 현재={current:,} (+{upper_limit_pct*100:.1f}%)"
                     )
-                    r = self.orders.sell(ticker, reason=f"상한가 즉시 매도 (+{upper_limit_pct*100:.1f}%)")
+                    r = self.orders.sell(ticker, reason=f"상한가 풀림 매도 (+{upper_limit_pct*100:.1f}%)")
                     if r:
                         r["trigger"] = "UPPER_LIMIT"
                         results.append(r)
@@ -187,14 +202,21 @@ class PositionMonitor:
             if partial_tp_done:
                 # ─────────────────────────────
                 # 잔여 물량 트레일링 스탑 (수익 극대화 핵심)
-                # 고정 % 익절로 자르지 않고 최고점 대비 -3% 이탈 시 청산하여
+                # 고정 % 익절로 자르지 않고 최고점 대비 트레일 폭 이탈 시 청산하여
                 # 추세가 살아있는 동안 잔여 50%를 끝까지 끌고 간다.
+                # 트레일 폭은 일봉 ATR에 비례(1.5×ATR%, 2~6% 클램프)시켜
+                # 변동성 큰 종목의 조기 청산을 방지한다.
                 # (하방은 본절선 dynamic_sl_price = entry*1.005 가 받쳐줌)
                 # ─────────────────────────────
-                if max_change - change >= 0.03:
+                trail_pct = 0.03
+                atr_val = pos.get("atr_value", 0)
+                if atr_val > 0 and entry > 0:
+                    trail_pct = max(0.02, min(0.06, 1.5 * atr_val / entry))
+                if max_change - change >= trail_pct:
                     logger.info(
                         f"[TS-R] {ticker} 잔여물량 트레일링 스탑 발동! "
-                        f"최고수익={max_change*100:.1f}% → 현재={change*100:+.1f}%"
+                        f"최고수익={max_change*100:.1f}% → 현재={change*100:+.1f}% "
+                        f"(트레일 폭 {trail_pct*100:.1f}%)"
                     )
                     r = self.orders.sell(
                         ticker,
@@ -464,8 +486,10 @@ class PositionMonitor:
                         results.append(r)
                 continue
 
-            # Track B/D (스윙/매집): 가격 기반 피라미딩
-            if track in ["B", "D"]:
+            # Track D (매집): 가격 기반 피라미딩
+            # Track B(눌림목 스윙)는 '-5% 물타기'가 추세 유지 전제와 모순되고
+            # 동적 손절선과 충돌하므로 단일 진입으로 운용 (물타기 제외)
+            if track == "D":
                 trigger = False
                 if step == 1 and change <= -0.05:
                     logger.info(f"[Pyramid] {name}({ticker}) Track {track} -5% 도달 (2차 매수 격발)")
@@ -494,6 +518,41 @@ class PositionMonitor:
                     r = self.orders.add_buy(ticker, reason=f"거미줄 {step+1}차 진입 (peak×{levels[step]})")
                     if r:
                         results.append(r)
+                continue
+
+            # Track F (메가트렌드): 종가 분할매집
+            # 매 거래일 14:50~15:05에 1회씩, 방어선(200일선 기반 dynamic_sl) 위에서
+            # 구조가 유지되는 동안 다음 차수를 매집한다 (매뉴얼: '종가 기준 분할 매집')
+            if track == "F":
+                in_close_window = (current_hour == 14 and current_minute >= 50) or \
+                                  (current_hour == 15 and current_minute <= 5)
+                if not in_close_window:
+                    continue
+
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                # 1차 진입 당일 및 같은 날 중복 매집 방지
+                et = pos.get("entry_time", datetime.now())
+                if isinstance(et, str):
+                    try:
+                        et = datetime.fromisoformat(et)
+                    except (ValueError, TypeError):
+                        et = datetime.now()
+                last_add = pos.get("last_add_date", et.strftime("%Y-%m-%d"))
+                if last_add == today_str:
+                    continue
+
+                # 방어선 이탈 시 매집 중단 (손절 여부는 check_all_positions가 판단)
+                dsl = pos.get("dynamic_sl_price", 0)
+                if dsl > 0 and current <= dsl:
+                    logger.info(f"[Pyramid] {name}({ticker}) Track F 방어선 이탈 → 매집 보류")
+                    continue
+
+                logger.info(f"[Pyramid] {name}({ticker}) Track F 종가 분할매집 {step+1}차 격발")
+                r = self.orders.add_buy(ticker, reason=f"메가트렌드 종가 매집 {step+1}차")
+                if r:
+                    pos["last_add_date"] = today_str
+                    self.orders._save_positions()
+                    results.append(r)
                 continue
 
         return results
@@ -525,8 +584,15 @@ class PositionMonitor:
             track = pos["track"]
             name = pos.get("name", ticker)
 
-            # Track A: 당일 마감 필수 → 무조건 정리
+            # Track A: 당일 마감 필수 → 정리
+            # 단, 상한가 잠김(매수잔량 압도) 종목은 익일 갭 기대값이 높아 예외 홀드
             if track == "A":
+                prev_close = quote.get("prev_close", 0)
+                if prev_close > 0 and (current - prev_close) / prev_close >= 0.295:
+                    ob = self.kis.get_orderbook(ticker)
+                    if ob.get("bid_ask_ratio", 0) >= 5:
+                        logger.info(f"[EOD] {name}({ticker}) Track A 상한가 잠김 → 오버나잇 홀드 (익일 갭 노림)")
+                        continue
                 logger.info(f"[EOD] {name}({ticker}) Track A 장마감 정리 (수익률={change*100:+.2f}%)")
                 r = self.orders.sell(ticker, reason=f"장마감 정리 (Track A) {change*100:+.1f}%")
                 if r:

@@ -323,10 +323,14 @@ class OrderManager:
             # 메가 트렌드 스윙: 전체 할당량(15%) 내 종가 분할매집 (5분할 기준)
             budget_per_slot = self.track_f_capital
             target_ratio = [0.2, 0.2, 0.2, 0.2, 0.2]
-        else:
-            # 중장기 슬롯 (B/D)
+        elif track == "B":
+            # 눌림목 스윙: 물타기 없이 단일 진입 (슬롯 예산 전액)
             budget_per_slot = self.swing_capital / self.max_swing_positions
-            target_ratio = [0.2, 0.3, 0.5] # 스윙/매집: 1차 20%, 2차 30%, 3차 50%
+            target_ratio = [1.0]
+        else:
+            # 세력주 매집 (D): 1차 20%, 2차 30%, 3차 50% 분할
+            budget_per_slot = self.swing_capital / self.max_swing_positions
+            target_ratio = [0.2, 0.3, 0.5]
 
         if step > len(target_ratio):
             return 0, budget_per_slot, target_ratio
