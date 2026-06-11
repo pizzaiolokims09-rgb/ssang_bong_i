@@ -11,6 +11,7 @@ orders.py - 자본금 분배, 매수/매도 주문 및 5대 안전장치 적용
 """
 import math
 import os
+import threading
 import time
 import logging
 from datetime import datetime
@@ -36,17 +37,18 @@ class OrderManager:
         # 포트폴리오 슬롯 분리 (올라운더 전략)
         self.max_short_positions = int(os.environ.get("MAX_SHORT_POSITIONS", 3)) # Track A, C
         self.max_swing_positions = int(os.environ.get("MAX_SWING_POSITIONS", 2)) # Track B, D
-        
-        # 자본금 배분 (단기 35%, 스윙 20%, 메가트렌드 15%, 폭락주 10%)
-        # 현금 버퍼(20%)는 위기 대응용 예비금으로 남겨둠
-        self.short_capital = self.total_capital * 0.35
-        self.swing_capital = self.total_capital * 0.20
-        self.track_f_capital = self.total_capital * 0.15
-        self.track_e_capital = self.total_capital * 0.10
-        
+
+        self._allocate_budgets()
+
         self.max_daily_loss = float(os.environ.get("MAX_DAILY_LOSS_PCT", 0.03))
 
+        # 수수료/세금 모델 (실현손익 정확도: 왕복 약 0.18% 비용 반영)
+        self.commission_rate = float(os.environ.get("COMMISSION_RATE", 0.00015))  # 위탁수수료 편도 0.015%
+        self.sell_tax_rate   = float(os.environ.get("SELL_TAX_RATE", 0.0015))     # 증권거래세(매도) 0.15%
+
         # 상태 관리
+        # 주문/포지션 변경 직렬화 락 (감시 스레드와 메인 스레드의 동시 매도 방지)
+        self.lock = threading.RLock()
         self.positions: Dict[str, dict] = {}      # {ticker: {entry_price, qty, track, step, ...}}
         self.pending_orders: Dict[str, dict] = {} # {ticker: {order_time, entry_price, step, ...}}
         self.watchlist: Dict[str, dict] = {}      # {ticker: {name, track, reason, ...}}
@@ -61,12 +63,83 @@ class OrderManager:
         self.pending_file = "data/pending_orders.json"
         self.cooldown_file = "data/cooldowns.json"
         self.watchlist_file = "data/watchlist.json"
+        self.daily_state_file = "data/daily_state.json"
         self.PENDING_TTL = 300  # 5분 (초)
         self.MAX_RETRY = 5
         self._load_positions()
         self._load_pending()
         self._load_cooldowns()
         self._load_watchlist()
+        self._load_daily_state()
+
+    def _allocate_budgets(self):
+        """트랙별 자본금 배분 (단기 35%, 스윙 20%, 메가트렌드 15%, 폭락주 10%)
+        현금 버퍼(20%)는 위기 대응용 예비금으로 남겨둠"""
+        self.short_capital = self.total_capital * 0.35
+        self.swing_capital = self.total_capital * 0.20
+        self.track_f_capital = self.total_capital * 0.15
+        self.track_e_capital = self.total_capital * 0.10
+
+    def sync_capital_from_balance(self):
+        """실잔고 기반 복리 운용 (SYNC_CAPITAL=true 설정 시에만)
+        모의투자 가상체결 환경에서는 계좌 잔고가 실제 매매를 반영하지 못하므로
+        기본은 비활성. 실전 전환 시 true 권장."""
+        if os.environ.get("SYNC_CAPITAL", "false").lower() != "true":
+            return
+        try:
+            bal = self.kis.get_balance()
+            out2 = bal.get("output2") or [{}]
+            tot = float(out2[0].get("tot_evlu_amt", 0) or 0)
+        except (ValueError, TypeError, IndexError, AttributeError) as e:
+            logger.warning(f"[Orders] 잔고 동기화 실패: {e}")
+            return
+        if tot >= 1_000_000:
+            logger.info(f"[Orders] 실잔고 자본 동기화: {self.total_capital:,.0f} -> {tot:,.0f}원")
+            self.total_capital = tot
+            self._allocate_budgets()
+
+    # ──────────────────────────────────────────
+    # 일일 상태 영속화 (재시작 시 손실 한도/손절 카운터 유지)
+    # ──────────────────────────────────────────
+    def _load_daily_state(self):
+        """당일 누적 손익/손절 카운터/킬스위치 복원 (날짜가 같을 때만)"""
+        if not os.path.exists(self.daily_state_file):
+            return
+        try:
+            import json
+            with open(self.daily_state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("date") == datetime.now().strftime("%Y-%m-%d"):
+                self.daily_pnl = float(data.get("daily_pnl", 0.0))
+                self.daily_track_a_losses = int(data.get("daily_track_a_losses", 0))
+                self.kill_switch = bool(data.get("kill_switch", False))
+                logger.info(
+                    f"[Orders] 일일 상태 복원: 손익={self.daily_pnl:+,.0f}원 "
+                    f"TrackA손절={self.daily_track_a_losses}회 "
+                    f"킬스위치={'ON' if self.kill_switch else 'OFF'}")
+        except Exception as e:
+            logger.error(f"[Orders] 일일 상태 로드 실패: {e}")
+
+    def _save_daily_state(self):
+        try:
+            import json
+            os.makedirs("data", exist_ok=True)
+            with open(self.daily_state_file, "w", encoding="utf-8") as f:
+                json.dump({
+                    "date": datetime.now().strftime("%Y-%m-%d"),
+                    "daily_pnl": self.daily_pnl,
+                    "daily_track_a_losses": self.daily_track_a_losses,
+                    "kill_switch": self.kill_switch,
+                }, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"[Orders] 일일 상태 저장 실패: {e}")
+
+    def reset_daily_state(self):
+        """자정 리셋: 다음 날 Track A 재활성화 및 킬스위치 해제"""
+        self.daily_pnl = 0.0
+        self.daily_track_a_losses = 0
+        self.kill_switch = False
+        self._save_daily_state()
 
     def _load_positions(self):
         """저장된 포지션 로드"""
@@ -222,6 +295,7 @@ class OrderManager:
         if self.daily_pnl <= -(self.total_capital * self.max_daily_loss):
             logger.critical(f"[Kill] 일일 손실 한도 도달: {self.daily_pnl:,.0f}원")
             self.kill_switch = True
+            self._save_daily_state()  # 재시작해도 당일은 차단 유지
             return False
 
         return True
@@ -277,6 +351,10 @@ class OrderManager:
 
         route_result: ai_router.route()의 반환값
         """
+        with self.lock:
+            return self._buy_locked(ticker, route_result)
+
+    def _buy_locked(self, ticker: str, route_result: dict) -> Optional[dict]:
         track = route_result["track"]
         track_info = route_result["track_info"]
         entry_price = route_result["entry_price"]
@@ -350,6 +428,19 @@ class OrderManager:
             logger.warning(f"[Order] {ticker} 이미 체결 대기 중 -> 중복 주문 차단")
             return None
 
+        # 시장가 여부 판별 (수량 계산 전에 체결가 현실화 필요)
+        is_market = god_mode or track_info["order_type"] == "market"
+
+        # 시장가 주문은 매도1호가(ask1)에 체결되는 것이 현실이므로
+        # 진입가를 ask1로 보정 (가상 체결 통계의 슬리피지 반영)
+        if is_market:
+            q_now = self.kis.get_quote(ticker)
+            ask1 = q_now.get("ask1", 0)
+            if ask1 > 0:
+                if ask1 != entry_price:
+                    logger.info(f"[Order] {ticker} 시장가 체결가 보정: {entry_price:,} -> ask1={ask1:,}")
+                entry_price = ask1
+
         # 1차 주문 수량 계산 (step=1)
         quantity, allocated_budget, target_ratio = self.calculate_position_size(entry_price, track, step=1)
         if quantity <= 0:
@@ -376,8 +467,7 @@ class OrderManager:
                     f"{existing_cost + new_cost:,.0f} > 한도={max_budget:,.0f}")
                 return None
 
-        # 시장가 여부 판별
-        is_market = god_mode or track_info["order_type"] == "market"
+        # 주문가 결정 (시장가=0, 지정가=entry_price)
         price = 0 if is_market else entry_price
 
         if god_mode:
@@ -481,6 +571,10 @@ class OrderManager:
         """
         보유 중인 종목의 다음 스텝(step) 추가 매수 실행
         """
+        with self.lock:
+            return self._add_buy_locked(ticker, reason)
+
+    def _add_buy_locked(self, ticker: str, reason: str) -> Optional[dict]:
         if ticker not in self.positions:
             return None
         
@@ -566,6 +660,10 @@ class OrderManager:
     # ──────────────────────────────────────────
     def sell(self, ticker: str, reason: str = "수동 매도", ratio: float = 1.0) -> Optional[dict]:
         """보유 종목 시장가 매도 (ratio=1.0이면 전량, 0.5이면 절반)"""
+        with self.lock:
+            return self._sell_locked(ticker, reason, ratio)
+
+    def _sell_locked(self, ticker: str, reason: str, ratio: float) -> Optional[dict]:
         if ticker not in self.positions:
             logger.warning(f"[Order] {ticker} 미보유 -> 매도 불가")
             return None
@@ -598,16 +696,24 @@ class OrderManager:
                     self.daily_track_a_losses += 1
                     logger.info(f"[Counter] Track A 일일 손절 누적: {self.daily_track_a_losses}회")
 
-            # 실현 손익 계산 (시장가이므로 현재가 기준 추정)
+            # 실현 손익 계산
+            # 시장가 매도는 매수1호가(bid1)에 체결되는 것이 현실 → 슬리피지 반영
             quote = self.kis.get_quote(ticker)
-            sell_price = quote.get("current", pos["entry_price"])
-            pnl = (sell_price - pos["entry_price"]) * sell_qty
+            sell_price = quote.get("bid1", 0) or quote.get("current", pos["entry_price"])
+
+            # 수수료/거래세 차감 (매수 수수료 + 매도 수수료 + 증권거래세)
+            buy_amount = pos["entry_price"] * sell_qty
+            sell_amount = sell_price * sell_qty
+            fees = (buy_amount * self.commission_rate
+                    + sell_amount * (self.commission_rate + self.sell_tax_rate))
+            pnl = (sell_price - pos["entry_price"]) * sell_qty - fees
             self.daily_pnl += pnl
+            self._save_daily_state()
 
             logger.info(
                 f"[Order] 매도 완료: {ticker} qty={sell_qty} "
                 f"진입={pos['entry_price']:,} 매도={sell_price:,} "
-                f"손익={pnl:+,.0f}원 ({reason})"
+                f"손익={pnl:+,.0f}원 (비용 {fees:,.0f}원 차감) ({reason})"
             )
 
             # 수량 차감 및 삭제 처리 (리턴값 구성을 위해 del 전에 미리 계산)
@@ -615,6 +721,7 @@ class OrderManager:
             pos_name = pos.get("name", ticker)
             pos_reason = pos.get("reason", "")
             pos_track = pos.get("track", "A")
+            pos_features = pos.get("quant_features", {})
 
             pos["quantity"] -= sell_qty
             if pos["quantity"] <= 0:
@@ -629,10 +736,13 @@ class OrderManager:
                 "entry_price": pos["entry_price"],
                 "sell_price": sell_price,
                 "pnl": pnl,
+                "fees": fees,
                 "reason": pos_reason,
                 "sell_reason": reason,
                 "track": pos_track,
-                "remaining_qty": max(remaining_qty, 0)
+                "remaining_qty": max(remaining_qty, 0),
+                # ML 학습 데이터: 진입 시점의 퀀트 피처를 매매일지로 전달
+                "quant_features": pos_features,
             }
 
         return None
@@ -653,6 +763,7 @@ class OrderManager:
             if r:
                 results.append(r)
         self.kill_switch = True
+        self._save_daily_state()
         logger.critical(f"[Kill] 전량 청산 완료: {len(results)}개 종목 ({reason})")
         return results
 
@@ -661,6 +772,10 @@ class OrderManager:
     # ──────────────────────────────────────────
     def confirm_pending(self, ticker: str) -> Optional[dict]:
         """미체결 주문이 체결됨 → positions로 이동"""
+        with self.lock:
+            return self._confirm_pending_locked(ticker)
+
+    def _confirm_pending_locked(self, ticker: str) -> Optional[dict]:
         if ticker not in self.pending_orders:
             return None
 
@@ -705,6 +820,10 @@ class OrderManager:
 
     def cancel_pending(self, ticker: str) -> bool:
         """미체결 주문 취소 (KIS API + 장부 정리)"""
+        with self.lock:
+            return self._cancel_pending_locked(ticker)
+
+    def _cancel_pending_locked(self, ticker: str) -> bool:
         if ticker not in self.pending_orders:
             return False
 

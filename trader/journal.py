@@ -4,6 +4,7 @@ journal.py - 자동 매매일지 작성 및 AI 최적화 루틴
 """
 import sqlite3
 import logging
+import time
 from datetime import datetime
 import json
 
@@ -47,6 +48,27 @@ class TradeJournal:
                 summary TEXT,
                 max_profit_cond TEXT,
                 max_loss_cond TEXT
+            )
+        ''')
+
+        # 섀도 후보 테이블 (SKIP/REJECT 종목의 반사실 데이터: ML 학습 표본 확보용)
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS shadow_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT,
+                ticker TEXT,
+                name TEXT,
+                skip_reason TEXT,
+                price_at_skip INTEGER,
+                eval_price INTEGER,
+                fwd_return_pct REAL,
+                vol_ratio REAL,
+                env_diff REAL,
+                bb_width REAL,
+                rsi REAL,
+                macd REAL,
+                adx REAL,
+                atr REAL
             )
         ''')
         
@@ -115,6 +137,80 @@ class TradeJournal:
         conn.close()
         
         return review
+
+    def record_shadow(self, ticker: str, name: str, skip_reason: str,
+                      price: int, features: dict = None):
+        """SKIP/REJECT된 후보 기록 (반사실 데이터: '안 샀으면 어땠을까')
+        같은 날 같은 종목은 1회만 기록한다."""
+        try:
+            if not ticker or price <= 0:
+                return
+            features = features or {}
+            today = datetime.now().strftime("%Y-%m-%d")
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute(
+                "SELECT COUNT(*) FROM shadow_candidates WHERE date LIKE ? AND ticker = ?",
+                (f"{today}%", ticker))
+            if c.fetchone()[0] > 0:
+                conn.close()
+                return
+            c.execute('''
+                INSERT INTO shadow_candidates (
+                    date, ticker, name, skip_reason, price_at_skip,
+                    eval_price, fwd_return_pct,
+                    vol_ratio, env_diff, bb_width, rsi, macd, adx, atr
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ticker, name, skip_reason, int(price),
+                features.get("vol_ratio", 0.0),
+                features.get("env_diff", 0.0),
+                features.get("bb_width", 0.0),
+                features.get("rsi", 50.0),
+                features.get("macd", 0.0),
+                features.get("adx", 0.0),
+                features.get("atr", 0.0),
+            ))
+            conn.commit()
+            conn.close()
+            logger.info(f"[Shadow] {name}({ticker}) SKIP 후보 기록 (가격={price:,})")
+        except Exception as e:
+            logger.error(f"[Shadow] 기록 실패 ({ticker}): {e}")
+
+    def evaluate_shadows(self, kis_client, max_count: int = 30) -> int:
+        """장 마감 후 당일 SKIP 후보의 현재가(종가)를 채워 미래수익률 라벨을 생성.
+        'SKIP이 옳았는지' 데이터가 쌓이면 ML 게이트 검증/학습에 활용한다."""
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute(
+                "SELECT id, ticker, price_at_skip FROM shadow_candidates "
+                "WHERE date LIKE ? AND eval_price IS NULL",
+                (f"{today}%",))
+            rows = c.fetchall()[:max_count]
+
+            evaluated = 0
+            for sid, tck, p0 in rows:
+                quote = kis_client.get_quote(tck)
+                cur = quote.get("current", 0)
+                if cur > 0 and p0 > 0:
+                    fwd = (cur - p0) / p0 * 100
+                    c.execute(
+                        "UPDATE shadow_candidates SET eval_price = ?, fwd_return_pct = ? WHERE id = ?",
+                        (cur, round(fwd, 2), sid))
+                    evaluated += 1
+                time.sleep(0.05)  # KIS API 부하 방지
+
+            conn.commit()
+            conn.close()
+            if evaluated:
+                logger.info(f"[Shadow] 당일 SKIP 후보 {evaluated}건 종가 평가 완료")
+            return evaluated
+        except Exception as e:
+            logger.error(f"[Shadow] 평가 실패: {e}")
+            return 0
 
     def generate_daily_summary(self):
         """당일 매매 요약 리포트 생성"""

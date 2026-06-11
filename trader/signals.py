@@ -479,6 +479,7 @@ class BaseScreener:
                 "trade_amount": trade_amount,
                 "market_cap":   market_cap,
                 "change_pct":   quote.get("change_pct", 0),
+                "exec_strength": quote.get("execution_strength", 0),
             })
 
         # 거래대금 순 정렬 (주도주 우선)
@@ -648,13 +649,19 @@ class BaseScreener:
         1) 최근 5일 내 수급 유입: 최근 5봉 내 전일 대비 거래량 50%+ 증가 이력 1회 이상
         2) 5일선 지지: 현재가가 5일선 위에서 위치 (추세 유지)
         3) 당일 거래량 축소: 당일 거래량이 전일 대비 크게 터지지 않고 쉬어가는 흐름 (전일 대비 120% 이하)
-        
+        4) 체결강도 100 이상: 당일 매수 체결이 매도 체결보다 우위 (수급 확인)
+
         반환: 조건 충족 종목 리스트
         """
         results = []
         for stock in candidates:
             ticker = stock["ticker"]
             current = stock["current"]
+
+            # 조건 4: 체결강도 (매수체결/매도체결 비율). 0이면 데이터 미수신 → 통과
+            es = stock.get("exec_strength", 0)
+            if 0 < es < 100:
+                continue
 
             # 일봉 데이터로 거래량 급증 이력 및 MA5 확인
             time.sleep(0.05)

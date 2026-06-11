@@ -185,6 +185,26 @@ class PositionMonitor:
                 continue
 
             if partial_tp_done:
+                # ─────────────────────────────
+                # 잔여 물량 트레일링 스탑 (수익 극대화 핵심)
+                # 고정 % 익절로 자르지 않고 최고점 대비 -3% 이탈 시 청산하여
+                # 추세가 살아있는 동안 잔여 50%를 끝까지 끌고 간다.
+                # (하방은 본절선 dynamic_sl_price = entry*1.005 가 받쳐줌)
+                # ─────────────────────────────
+                if max_change - change >= 0.03:
+                    logger.info(
+                        f"[TS-R] {ticker} 잔여물량 트레일링 스탑 발동! "
+                        f"최고수익={max_change*100:.1f}% → 현재={change*100:+.1f}%"
+                    )
+                    r = self.orders.sell(
+                        ticker,
+                        reason=f"잔여물량 트레일링 스탑 (고점 {max_change*100:.1f}% → {change*100:+.1f}%)"
+                    )
+                    if r:
+                        r["trigger"] = "TRAILING_STOP"
+                        results.append(r)
+                    continue
+
                 # 50% 익절 완료 후: 4대 매도 트리거로 추세 전환 감지 시 청산
                 # 분봉 데이터 조회 (1분봉)
                 minute_candles = self.kis.get_minute_chart(ticker)
@@ -234,8 +254,10 @@ class PositionMonitor:
 
             # ─────────────────────────────────
             # 기존 익절선 도달 (전량 익절)
+            # 분할익절 완료 포지션은 고정 TP로 자르지 않고
+            # 위의 트레일링 스탑 + 4대 트리거에 맡긴다 (추세 추종)
             # ─────────────────────────────────
-            if change >= tp_pct:
+            if not partial_tp_done and change >= tp_pct:
                 logger.info(
                     f"[TP] {ticker} 익절 도달! "
                     f"진입={entry:,} 현재={current:,} 수익={change*100:+.2f}%"
@@ -549,55 +571,5 @@ class PositionMonitor:
 
         return results
 
-    # ──────────────────────────────────────────
-    # 정오(12:00) 이후 단타 포지션 정리
-    # ──────────────────────────────────────────
-    def check_midday_liquidation(self, current_hour: int, current_minute: int) -> list:
-        """
-        12시 이후 Track A(단타) 포지션 정리 및 스윙 전환 전략
-        - Track A 종목 중 현재가가 진입가 또는 손절가 위에서 지지받고 있다면 Track C(종배)로 전환.
-        - 그렇지 못하고 흐르는 종목은 약손절/본절 탈출.
-        """
-        results = []
-        if current_hour < 12:
-            return results
-
-        tickers = list(self.orders.positions.keys())
-        for ticker in tickers:
-            pos = self.orders.positions[ticker]
-            if pos["track"] == "A":
-                quote = self.kis.get_quote(ticker)
-                current = quote.get("current", 0)
-                if current <= 0:
-                    continue
-
-                entry = pos["entry_price"]
-                change = (current - entry) / entry if entry > 0 else 0
-                name = pos.get("name", ticker)
-                dynamic_sl = pos.get("dynamic_sl_price", 0)
-
-                # 손절가 이탈 여부
-                if dynamic_sl > 0 and current <= dynamic_sl:
-                    logger.info(f"[Midday] {name}({ticker}) 지지 이탈. 약손절 ({change*100:+.2f}%)")
-                    r = self.orders.sell(ticker, reason=f"오후 단타 지지 이탈 {change*100:+.1f}%")
-                    if r:
-                        r["trigger"] = "MIDDAY_LIQUIDATION"
-                        results.append(r)
-                    continue
-
-                # 12시 이후 수익권이거나 진입가 부근(-1.5% 이상)에서 지지 중이면 종가베팅(Track C)으로 전환
-                if change >= -0.015:
-                    logger.info(f"[Midday] {name}({ticker}) 12시 이후 지지 확인. Track C(종배)로 전환 (수익률: {change*100:+.2f}%)")
-                    pos["track"] = "C"
-                    pos["reason"] += " [오후 스윙 전환]"
-                    self.orders._save_positions()
-                else:
-                    # 그 외 흐르는 종목은 약손절
-                    if current_hour >= 13 or (current_hour == 12 and current_minute >= 30):
-                        logger.info(f"[Midday] {name}({ticker}) Track A 오후 모멘텀 상실 약손절 ({change*100:+.2f}%)")
-                        r = self.orders.sell(ticker, reason=f"오후 모멘텀 상실 약손절 {change*100:+.1f}%")
-                        if r:
-                            r["trigger"] = "MIDDAY_LIQUIDATION"
-                            results.append(r)
-
-        return results
+    # (구) check_midday_liquidation(12:00 점심정리)은 사용자 요청으로 기능 제거 후
+    # 호출처 없는 데드코드로 남아있어 삭제됨 (2026-06-12)

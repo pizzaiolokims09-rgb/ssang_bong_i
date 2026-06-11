@@ -312,13 +312,15 @@ def get_sell_signals(minute_candles: list, daily_candles: list) -> dict:
     """
     4대 매도 트리거를 종합 판정하여 반환합니다.
 
-    1) 패닉셀: 직전 5봉 평균 대비 3배+ 매도 폭발 + 음봉
-    2) MACD 매도: MACD 히스토그램이 양 → 음 전환 (직전 2봉 비교)
+    1) 패닉셀: 직전 5봉 평균 대비 3배+ 매도 폭발 + 음봉 (분봉 기준)
+    2) MACD 매도: MACD 히스토그램이 양 → 음 전환 (일봉 기준, 직전 2봉 비교)
+       ※ KIS 분봉 API는 30봉만 반환해 MACD(12,26,9)에 필요한 35봉을
+         확보할 수 없으므로 반드시 일봉으로 계산한다.
     3) 데드크로스: MA5 < MA20 (일봉 기준)
     4) RSI 과매수: RSI > 70
 
-    minute_candles: 분봉 데이터 (최신이 앞, 패닉셀 + MACD용)
-    daily_candles: 일봉 데이터 (최신이 앞, 데드크로스 + RSI + ADX용)
+    minute_candles: 분봉 데이터 (최신이 앞, 패닉셀용)
+    daily_candles: 일봉 데이터 (최신이 앞, MACD + 데드크로스 + RSI + ADX용)
 
     반환: {
         "panic_sell": bool,
@@ -359,21 +361,22 @@ def get_sell_signals(minute_candles: list, daily_candles: list) -> dict:
                     f"[Quant] 패닉셀 감지! 거래량={vol_ratio:.1f}배 + 음봉"
                 )
 
-    # ── 2) MACD 매도 시그널 (분봉 기준) ──
-    if minute_candles and len(minute_candles) >= 40:
-        macd_data = calc_macd(minute_candles)
+    # ── 2) MACD 매도 시그널 (일봉 기준) ──
+    # 분봉은 KIS API 한계로 30봉뿐이라 MACD(12,26,9) 계산이 항상 불가능했음
+    # → 일봉 히스토그램의 양 → 음 전환으로 추세 이탈을 감지한다.
+    if daily_candles and len(daily_candles) >= 36:
+        macd_data = calc_macd(daily_candles)
         result["macd_histogram"] = macd_data["histogram"]
 
-        # 직전 2봉의 MACD로 히스토그램 전환 감지
-        if len(minute_candles) >= 41:
-            prev_macd = calc_macd(minute_candles[1:])
-            if prev_macd["histogram"] > 0 and macd_data["histogram"] < 0:
-                result["macd_bearish"] = True
-                logger.info(
-                    f"[Quant] MACD 매도 시그널: "
-                    f"이전 Hist={prev_macd['histogram']:.2f} → "
-                    f"현재 Hist={macd_data['histogram']:.2f}"
-                )
+        # 직전 봉 대비 히스토그램 전환 감지 (전일 양수 → 당일 음수)
+        prev_macd = calc_macd(daily_candles[1:])
+        if prev_macd["histogram"] > 0 and macd_data["histogram"] < 0:
+            result["macd_bearish"] = True
+            logger.info(
+                f"[Quant] MACD 매도 시그널 (일봉): "
+                f"전일 Hist={prev_macd['histogram']:.2f} → "
+                f"당일 Hist={macd_data['histogram']:.2f}"
+            )
 
     # ── 3) 데드크로스 (일봉 기준) ──
     if daily_candles and len(daily_candles) >= 20:

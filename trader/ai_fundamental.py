@@ -59,7 +59,7 @@ class FundamentalScanner:
                 },
             }
             try:
-                resp = requests.post(url, json=payload, timeout=120)
+                resp = requests.post(url, json=payload, timeout=60)
                 resp.raise_for_status()
                 data = resp.json()
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -86,7 +86,7 @@ class FundamentalScanner:
                 },
             }
             try:
-                resp = requests.post(url, json=payload, timeout=120)
+                resp = requests.post(url, json=payload, timeout=60)
                 resp.raise_for_status()
                 data = resp.json()
                 text = data["candidates"][0]["content"]["parts"][0]["text"]

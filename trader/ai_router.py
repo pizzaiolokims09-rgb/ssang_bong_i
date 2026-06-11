@@ -134,7 +134,8 @@ class MultiAssetCouncil:
                 },
             }
             # Pro 모델은 타임아웃 넉넉히, Flash는 빠르게
-            timeout = 120 if model == self.model_primary else 60
+            # (감시는 별도 스레드지만, 스캔 사이클이 늘어지지 않도록 60초로 제한)
+            timeout = 60 if model == self.model_primary else 30
 
             try:
                 resp = requests.post(url, json=payload, timeout=timeout)

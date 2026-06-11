@@ -12,6 +12,7 @@ run.py - 쌍봉봇 메인 심장박동 루프
 import logging
 import os
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -42,6 +43,7 @@ def main():
     """메인 실행 함수"""
     from trader.kis_client import KISClient
     from trader.signals import BaseScreener, detect_volume_spike, aggregate_5m_candles, find_5m_pivot_low, calculate_envelope, calculate_bb_ema, evaluate_smc_structure, calculate_vwap, calculate_atr
+    from trader.quant_indicators import get_ml_features
     from trader.ai_router import MultiAssetCouncil, TRACKS, volume_confirm_filter
     from trader.orders import OrderManager
     from trader.monitor import PositionMonitor
@@ -177,6 +179,7 @@ def main():
 
     def cmd_resume():
         orders.kill_switch = False
+        orders._save_daily_state()  # 재시작에도 해제 상태 유지
         telegram.notify_system("봇 재개됨. 킬 스위치 해제.")
 
     # /start 명령어 (메뉴 재전송)
@@ -207,6 +210,9 @@ def main():
 
     telegram.register_command("confirm_stop", confirm_emergency_stop) # 비상정지 컨펌됨
 
+    # 실잔고 기반 자본 동기화 (SYNC_CAPITAL=true 시, 복리 운용)
+    orders.sync_capital_from_balance()
+
     # 시작 알림 및 메인 메뉴 전송
     env_label = "모의투자" if kis.env == "demo" else "실전매매"
     telegram.send(
@@ -223,6 +229,33 @@ def main():
     SCAN_INTERVAL = 60     # 기본 스캔 주기 (초)
     MONITOR_INTERVAL = 10  # 포지션 감시 주기 (초)
 
+    # ──────────────────────────────────────
+    # 포지션 감시 전용 스레드
+    # 메인 루프가 Gemini 추론(수십 초~수 분)으로 블로킹되어도
+    # 손절/익절 감시는 10초 주기를 유지해야 한다.
+    # ──────────────────────────────────────
+    def monitor_worker():
+        while True:
+            time.sleep(MONITOR_INTERVAL)
+            try:
+                t = datetime.now()
+                if t.weekday() >= 5:
+                    continue
+                # 장중(09:00~15:30)에만 감시
+                if t.hour < 9 or t.hour >= 16 or (t.hour == 15 and t.minute > 30):
+                    continue
+                if not orders.positions:
+                    continue
+                results = monitor.check_all_positions()
+                for r in results:
+                    telegram.notify_sell(r)
+                    journal.record_trade(r, orders.total_capital)
+            except Exception as e:
+                logger.error(f"[MonitorThread] 감시 루프 에러: {e}", exc_info=True)
+
+    threading.Thread(target=monitor_worker, daemon=True, name="position-monitor").start()
+    logger.info("[Main] 포지션 감시 전용 스레드 시작 (10초 주기, 메인 루프와 독립)")
+
     last_scan_time = 0
     last_monitor_time = 0
     last_idle_log_time = 0
@@ -233,6 +266,11 @@ def main():
     # 알림 스팸 방지용 캐시 (종목별 SKIP 알림 시간 기록)
     skip_notified_cooldown = {}
     SKIP_NOTIFY_INTERVAL = 3600  # 1시간 (초)
+
+    # AI SKIP 판정 캐시: 최근 SKIP/저신뢰 판정 종목은 일정 시간 재분석 생략
+    # (동일 주도주를 60초마다 Gemini Pro로 재분석하던 비용/지연 낭비 차단)
+    ai_skip_cache = {}
+    AI_SKIP_TTL = 900  # 15분 (초)
     
     BOT_START_TIME = time.time()
 
@@ -291,8 +329,16 @@ def main():
                     last_idle_log_time = current_time
                 continue
 
-            # 프리장 + 장 마감 후
-            if current_hour < 9 or (current_hour >= 15 and current_minute > 30):
+            # 프리장 + 장 마감 후 (15:30 초과 ~ 익일 09:00 전)
+            # 주의: "hour >= 15 and minute > 30" 단독 조건은 16:00~16:30 같은
+            # 매시 00~30분 구간을 차단하지 못하므로 hour >= 16 조건을 별도로 둔다.
+            is_after_hours = (
+                current_hour < 9
+                or current_hour >= 16
+                or (current_hour == 15 and current_minute > 30)
+            )
+
+            if is_after_hours:
                 # 자정이 넘어가면 일지 생성 플래그 리셋 (다음날 준비)
                 if current_hour == 0:
                     journal_generated_today = False
@@ -300,10 +346,10 @@ def main():
                     pykrx_fetched_today = False
                     # 메모리 누수 방지: 캐시 초기화
                     skip_notified_cooldown.clear()
+                    ai_skip_cache.clear()
                     orders.entry_cooldown.clear()
-                    # 일일 카운터 리셋 (다음 날 Track A 재활성화 및 킬스위치 오작동 방지)
-                    orders.daily_track_a_losses = 0
-                    orders.daily_pnl = 0.0
+                    # 일일 카운터 리셋 + 파일 영속화 (재시작에도 유지되는 상태를 날짜 단위로 초기화)
+                    orders.reset_daily_state()
                     # Track A 차단 알림 플래그 리셋
                     if hasattr(main, '_track_a_block_logged'):
                         del main._track_a_block_logged
@@ -316,9 +362,11 @@ def main():
                 logger.info("[Main] 08:50 일일 스윙/메가트렌드 후보군(pykrx) 추출 시작")
                 daily_swing_candidates = pykrx_scanner.fetch_daily_swing_candidates(top_n=50)
                 pykrx_fetched_today = True
+                # 장 시작 전 실잔고 기준 자본 재배분 (SYNC_CAPITAL=true 시)
+                orders.sync_capital_from_balance()
 
             # 프리장 + 장 마감 후 다시 체크 (8시 50분 작업 이후 스킵 처리)
-            if current_hour < 9 or (current_hour >= 15 and current_minute > 30):
+            if is_after_hours:
                 # 장 마감 일지 요약 및 AI 고도화 루틴 (15:35 이후 최초 1회)
                 if current_hour == 15 and current_minute > 35 and not journal_generated_today:
                     journal_generated_today = True
@@ -327,7 +375,10 @@ def main():
                     # 1) 당일 매매 요약 전송
                     summary = journal.generate_daily_summary()
                     telegram.send(summary)
-                    
+
+                    # 1.5) 당일 SKIP 후보 종가 평가 (반사실 ML 데이터 라벨링)
+                    journal.evaluate_shadows(kis)
+
                     # 2) AI 두뇌 고도화 루틴 (30개 도달 시 10개 요약)
                     opt_msg = journal.optimize_brain_if_needed()
                     if opt_msg:
@@ -344,11 +395,7 @@ def main():
             if current_time - last_monitor_time >= MONITOR_INTERVAL:
                 last_monitor_time = current_time
 
-                # 1) 보유 포지션 손익 감시
-                results = monitor.check_all_positions()
-                for r in results:
-                    telegram.notify_sell(r)
-                    journal.record_trade(r, orders.total_capital)
+                # 1) 보유 포지션 손익 감시는 전용 스레드(monitor_worker)에서 수행
 
                 # 2) 미체결 주문 체결 확인
                 confirmed = monitor.check_pending_fills()
@@ -483,24 +530,41 @@ def main():
                         
                     # 최신 피처값 추출
                     features = get_ml_features(d_cndls, cndls)
-                    
-                    # ML 승률 게이트 (Watchlist는 70% 기준)
+
+                    # ML 승률 게이트 (모델 보유 시 70% 기준)
                     ml_result = fundamental.ml_predict_gate(name, tck, features)
                     prob = ml_result.get("confidence", 0)
-                    
-                    if prob >= 70:
-                        logger.info(f"[Sniper] 🎯 {name}({tck}) ML 승률 70% 돌파! ({prob:.1f}%) -> 매수 격발")
+
+                    # 모델 미보유 시 confidence가 항상 50으로 고정되어 70%를
+                    # 영원히 못 넘는 데드락이 발생하므로, 룰 기반 폴백으로 격발한다.
+                    has_ml_model = os.path.exists("data/ml_brain.pkl")
+                    if has_ml_model:
+                        fire = prob >= 70
+                        wait_reason = f"ML 승률 대기 중: {prob:.1f}%"
+                    elif trk == "C":
+                        # 종가 베팅: 14:45 이후 도달 시 격발
+                        t_now = datetime.now()
+                        fire = (t_now.hour == 14 and t_now.minute >= 45) or t_now.hour == 15
+                        wait_reason = "종가 베팅 시간(14:45) 대기 중"
+                    else:
+                        # B/D/F 등: AI가 제시한 진입가 +1% 이내 도달 시 격발
+                        target_entry = route_res.get("entry_price", 0)
+                        fire = target_entry > 0 and cur_price <= target_entry * 1.01
+                        wait_reason = f"진입가 대기 중 (목표 {target_entry:,} / 현재 {cur_price:,})"
+
+                    if fire:
+                        logger.info(f"[Sniper] 🎯 {name}({tck}) 매수 조건 충족! (ML {prob:.1f}%, 모델={'O' if has_ml_model else 'X'}) -> 매수 격발")
                         route_res["entry_price"] = cur_price
                         route_res["quant_features"] = features
-                        
+
                         b_result = orders.buy(tck, route_res)
                         if b_result:
                             telegram.notify_buy(b_result)
                             logger.info(f"[BUY] {name} Track {trk} Sniper 매수 완료!")
-                            
+
                         orders.remove_from_watchlist(tck)
                     else:
-                        logger.info(f"[Sniper] {name}({tck}) ML 승률 대기 중: {prob:.1f}%")
+                        logger.info(f"[Sniper] {name}({tck}) {wait_reason}")
                         
             check_watchlist_sniper()
 
@@ -549,6 +613,16 @@ def main():
                     time.sleep(0.1)
                     
                     if not minute_candles:
+                        continue
+
+                    # 저변동성 필터: 1분 ATR이 가격의 0.15% 미만이면 호가 탄력이 없는
+                    # 무거운 종목(ETF류 등) → 단타 회전 불가, Track A 부적합
+                    atr_1m = calculate_atr(minute_candles, period=20)
+                    if atr_1m > 0 and p_stock["current"] > 0 and atr_1m / p_stock["current"] < 0.0015:
+                        logger.info(
+                            f"  🚫 [저변동성] {p_stock['name']} 1분 ATR={atr_1m:,.0f} "
+                            f"({atr_1m / p_stock['current'] * 100:.3f}%) → Track A 부적합"
+                        )
                         continue
 
                     # 5분봉 합성
@@ -618,12 +692,22 @@ def main():
                     trigger_reason = "5분봉 추세 전환(MSS)" + (" + 거래량 폭발" if spike else "")
 
                     # ── VWAP 필터 (기관 매매 흐름 확인) ──
-                    vwap = calculate_vwap(minute_candles)
+                    # 당일 VWAP = 누적거래대금 / 누적거래량 (분봉 30개로는 30분치 VWAP밖에 안 나옴)
+                    day_volume = p_stock.get("volume", 0)
+                    if day_volume > 0 and p_stock.get("trade_amount", 0) > 0:
+                        vwap = p_stock["trade_amount"] / day_volume
+                    else:
+                        vwap = calculate_vwap(minute_candles)  # 폴백: 최근 30분 VWAP
                     if vwap > 0 and p_stock["current"] < vwap:
                         logger.info(
                             f"  🚫 [VWAP] {p_stock['name']} 현재가={p_stock['current']:,} < "
                             f"VWAP={vwap:,.0f} → 기관 매도 구간, 진입 보류"
                         )
+                        continue
+
+                    # AI SKIP 캐시: 최근 15분 내 SKIP 판정 종목은 재분석 생략
+                    if current_time - ai_skip_cache.get(p_ticker, 0) < AI_SKIP_TTL:
+                        logger.info(f"  ⏳ [AI Cache] {p_stock['name']} 최근 SKIP 판정 → 재분석 생략")
                         continue
 
                     # ── AI 2중 검증 (God Mode 제거) ──
@@ -658,6 +742,11 @@ def main():
                             f"  ❌ [AI 검증] {p_stock['name']} AI SKIP → "
                             f"{route_result['reason'][:120]}"
                         )
+                        ai_skip_cache[p_ticker] = current_time
+                        journal.record_shadow(p_ticker, p_stock["name"],
+                                              f"AI SKIP: {route_result['reason'][:100]}",
+                                              p_stock["current"],
+                                              route_result.get("quant_features", {}))
                         continue
 
                     # 검색식 통과 종목은 신뢰도 60% 이상 요구
@@ -666,12 +755,23 @@ def main():
                             f"  ❌ [AI 검증] {p_stock['name']} 신뢰도 부족 "
                             f"({route_result['confidence']:.0%}) → 진입 보류"
                         )
+                        ai_skip_cache[p_ticker] = current_time
                         continue
 
                     logger.info(
                         f"  ✅ [AI 검증] {p_stock['name']} Track {route_result['track']} "
                         f"승인! 신뢰도={route_result['confidence']:.0%}"
                     )
+
+                    # ── ML 승률 게이트 (로컬 모델, 비용/지연 없음) ──
+                    features_p = route_result.get("quant_features") or get_ml_features(daily_candles_p, minute_candles)
+                    ml_gate_p = fundamental.ml_predict_gate(p_stock["name"], p_ticker, features_p)
+                    if ml_gate_p["verdict"] == "REJECT":
+                        logger.info(
+                            f"  ❌ [ML Gate] {p_stock['name']} 승률 예측 미달 → 진입 보류 "
+                            f"({ml_gate_p.get('reason', '')})"
+                        )
+                        continue
 
                     # ── ATR 기반 동적 손절선 (변동성 적응형) ──
                     track_a_info = TRACKS["A"].copy()
@@ -707,6 +807,11 @@ def main():
                         "trigger_candle_low": pivot_low,
                         "dynamic_sl_price": dynamic_sl,
                         "peak_200d": 0,
+                        "atr_value": route_result.get("atr_value", 0),
+                        "atr_sl_price": route_result.get("atr_sl_price", 0),
+                        "atr_tp_price": route_result.get("atr_tp_price", 0),
+                        # ML 학습 데이터 축적: 진입 시점 퀀트 피처 저장
+                        "quant_features": features_p,
                     }
 
                     buy_result = orders.buy(p_ticker, verified_route)
@@ -783,11 +888,20 @@ def main():
                 logger.info(f"[PreFilter] 트랙 후보 태깅: {track_hints}")
 
             # ─────── Phase 2: AI Routing ───────
-            for stock in candidates[:5]:  # 상위 5개만 AI 분석
+            # 상위 5개 + 트랙 사전필터(B~G)에 태깅된 6~15위 종목까지 분석
+            # (태깅만 해놓고 AI 라우팅을 안 하면 해당 트랙 진입 기회가 통째로 사라짐)
+            hinted_extra = [s for s in candidates[5:15] if s["ticker"] in track_hints]
+            analysis_targets = candidates[:5] + hinted_extra[:5]
+
+            for stock in analysis_targets:
                 ticker = stock["ticker"]
 
                 # 이미 보유 중이면 건너뛰기
                 if ticker in orders.positions:
+                    continue
+
+                # AI SKIP 캐시: 최근 15분 내 SKIP 판정 종목은 재분석 생략 (비용 절감)
+                if current_time - ai_skip_cache.get(ticker, 0) < AI_SKIP_TTL:
                     continue
 
                 # 포지션 한도 체크 (단기와 중장기 합산 5개 도달 시 중단)
@@ -872,6 +986,11 @@ def main():
 
                 if route_result["track"] == "SKIP":
                     logger.info(f"[SKIP] {stock['name']} 진입 보류: {route_result.get('reason', '')}")
+                    ai_skip_cache[ticker] = current_time
+                    journal.record_shadow(ticker, stock["name"],
+                                          f"SKIP: {route_result.get('reason', '')[:100]}",
+                                          stock.get("current", 0),
+                                          route_result.get("quant_features", {}))
                     continue
 
                 # 종가 베팅 시간이 아닌데 Track C로 판정되면 건너뛰기
@@ -905,6 +1024,7 @@ def main():
                 # 신뢰도 50% 미만은 건너뛰기
                 if route_result["confidence"] < 0.5:
                     logger.info(f"[Route] 신뢰도 부족 ({route_result['confidence']:.0%}) -> 패스")
+                    ai_skip_cache[ticker] = current_time
                     continue
 
                 # ─────── 상한가 원천 차단 ───────
@@ -953,6 +1073,11 @@ def main():
                         f"[Gate REJECT] {stock['name']}({ticker}) "
                         f"Phase 3 검증 실패 -> 매수 차단. "
                         f"사유: {gate.get('summary', '')[:100]}")
+                    ai_skip_cache[ticker] = current_time
+                    journal.record_shadow(ticker, stock["name"],
+                                          f"Gate REJECT: {gate.get('summary', '')[:100]}",
+                                          stock.get("current", 0),
+                                          route_result.get("quant_features", {}))
                     continue
                 elif gate["verdict"] == "REDUCE":
                     logger.info(
@@ -981,16 +1106,14 @@ def main():
         telegram.send("🔴 <b>쌍봉봇 수동 종료</b>")
     except Exception as e:
         logger.critical(f"치명적 에러: {e}", exc_info=True)
-        telegram.send(f"🚨 <b>시스템 점검/서버 에러 감지</b>\n1분 후 자동 재시작을 시도합니다.\n에러 원인: {str(e)[:100]}")
-        # 비상 청산
-        try:
-            results = orders.liquidate_all("치명적 에러 비상청산")
-            for r in results:
-                telegram.notify_sell(r)
-                journal.record_trade(r, orders.total_capital)
-        except Exception:
-            pass
-        
+        # 인프라성 에러(토큰/네트워크 등)로 보유 포지션을 투매하면 안 되므로
+        # 청산하지 않고 그대로 재시작에 맡긴다. (포지션은 positions.json으로 복원됨)
+        telegram.send(
+            f"🚨 <b>시스템 점검/서버 에러 감지</b>\n"
+            f"1분 후 자동 재시작을 시도합니다.\n"
+            f"보유 포지션은 청산하지 않고 유지합니다 (재시작 후 감시 재개).\n"
+            f"에러 원인: {str(e)[:100]}"
+        )
         # 시스템 데몬이 바로 살려내며 스팸을 보내지 못하도록 강제 쿨다운
         time.sleep(60)
     finally:
