@@ -855,6 +855,7 @@ def main():
                             f"  ❌ [ML Gate] {p_stock['name']} 승률 예측 미달 → 진입 보류 "
                             f"({ml_gate_p.get('reason', '')})"
                         )
+                        ai_skip_cache[p_ticker] = current_time
                         continue
 
                     # ── ATR 기반 동적 손절선 (변동성 적응형) ──
@@ -1092,28 +1093,34 @@ def main():
                 # 안전장치 #1: 볼륨 확증 필터 (돌파형 트랙 A/C에만 적용)
                 if route_result["track"] in ["A", "C"] and not volume_confirm_filter(candles):
                     logger.info(f"[Scan] {stock['name']} 볼륨 확증 미달 (Track {route_result['track']}) -> 패스")
+                    ai_skip_cache[ticker] = current_time
                     continue
 
                 # 종가 베팅 시간이 아닌데 Track C로 판정되면 건너뛰기
                 if route_result["track"] == "C" and not is_closing_time:
                     logger.info(f"[Route] Track C지만 종가시간 아님 (15:00~) -> 대기")
+                    ai_skip_cache[ticker] = current_time
                     continue
 
                 # 단타(Track A)는 09:30~14:30만 허용 (장초반 변동성 회피 + 종배 겹침 방지)
                 if route_result["track"] == "A":
                     if current_hour == 9 and current_minute < 30:
                         logger.info(f"[Route] Track A는 09:30 이후부터 진입 가능 (장초반 변동성 회피) -> 대기")
+                        ai_skip_cache[ticker] = current_time
                         continue
                     if current_hour > 14 or (current_hour == 14 and current_minute >= 30):
                         logger.info(f"[Route] Track A는 오후 14:30까지만 진입 가능 -> 대기")
+                        ai_skip_cache[ticker] = current_time
                         continue
                     if orders.daily_track_a_losses >= 4:
                         logger.info(f"[Route] Track A 일일 손절 {orders.daily_track_a_losses}회 → 금일 Track A 비활성화")
+                        ai_skip_cache[ticker] = current_time
                         continue
 
                 # 본장 시간에 Track D(중장기)는 오후에만 허용
                 if route_result["track"] == "D" and current_hour < 14:
                     logger.info(f"[Route] Track D는 오후 진입 -> 대기")
+                    ai_skip_cache[ticker] = current_time
                     continue
 
                 # Track F는 God Mode 절대 금지 + 종가 기준 분할 매집만 허용
@@ -1135,6 +1142,7 @@ def main():
                         f"[Block] {stock['name']}({ticker}) 상한가 차단! "
                         f"등락률={stock['change_pct']:+.1f}% -> 진입 불가"
                     )
+                    ai_skip_cache[ticker] = current_time
                     continue
                 # 방법 2: prev_close 기반 (fallback, prev_close가 있는 경우만)
                 prev_close = stock.get("prev_close", 0)
@@ -1147,6 +1155,7 @@ def main():
                             f"전일종가={prev_close:,} 현재={current_price:,} "
                             f"(+{change_from_prev*100:.1f}%) -> 진입 불가"
                         )
+                        ai_skip_cache[ticker] = current_time
                         continue
 
                 # ─────── Phase 3: Fail-Close 최종 관문 ───────
