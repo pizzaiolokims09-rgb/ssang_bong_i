@@ -226,7 +226,7 @@ def main():
     # ──────────────────────────────────────
     # 스캔 주기 설정
     # ──────────────────────────────────────
-    SCAN_INTERVAL = 60     # 기본 스캔 주기 (초)
+    SCAN_INTERVAL = 120    # 기본 스캔 주기 (초) — 단타는 Phase 1.5 피벗 스나이퍼가 담당하므로 AI 호출 비용 절감을 위해 완화
     MONITOR_INTERVAL = 10  # 포지션 감시 주기 (초)
 
     # ──────────────────────────────────────
@@ -270,7 +270,7 @@ def main():
     # AI SKIP 판정 캐시: 최근 SKIP/저신뢰 판정 종목은 일정 시간 재분석 생략
     # (동일 주도주를 60초마다 Gemini Pro로 재분석하던 비용/지연 낭비 차단)
     ai_skip_cache = {}
-    AI_SKIP_TTL = 900  # 15분 (초)
+    AI_SKIP_TTL = 1800  # 30분 (초) — SKIP/타이밍 보류 판정 재분석 간격 (Pro/Flash 호출 절감)
 
     # B/F 전용 수급주 유니버스 캐시 (pykrx 기관/외인 순매수 상위, 5분 갱신)
     # 눌림목(B)/장기 눌림(F)은 '오늘 조용한 종목'이라 거래량 상위 유니버스에
@@ -983,9 +983,11 @@ def main():
             # ─────── Phase 2: AI Routing ───────
             # 상위 5개 + 트랙 사전필터(B~G)에 태깅된 6~15위 종목 + 수급주 유니버스에서
             # 태깅된 종목까지 분석 (태깅만 해놓고 라우팅을 안 하면 진입 기회가 사라짐)
+            # 비용 절감: AI 라우팅 대상 수를 축소 (최대 13 → 6).
+            # 상위 후보 위주로 분석하고, 나머지는 다음 사이클/캐시로 자연 분산.
             hinted_extra = [s for s in candidates[5:15] if s["ticker"] in track_hints]
             swing_hinted = [s for t, s in swing_by_ticker.items() if t in track_hints]
-            analysis_targets = candidates[:5] + hinted_extra[:5] + swing_hinted[:3]
+            analysis_targets = candidates[:3] + hinted_extra[:2] + swing_hinted[:1]
 
             # 글로벌 테마 관련주 우선 분석 (수급이 몰릴 확률이 높은 종목부터)
             analysis_targets.sort(key=lambda s: 0 if s["ticker"] in theme_map else 1)
@@ -1090,30 +1092,37 @@ def main():
                     continue
 
                 # 안전장치 #1: 볼륨 확증 필터 (돌파형 트랙 A/C에만 적용)
+                # 캐시 등록으로 다음 사이클 즉시 AI 재호출(비용 누수) 방지
                 if route_result["track"] in ["A", "C"] and not volume_confirm_filter(candles):
                     logger.info(f"[Scan] {stock['name']} 볼륨 확증 미달 (Track {route_result['track']}) -> 패스")
+                    ai_skip_cache[ticker] = current_time
                     continue
 
                 # 종가 베팅 시간이 아닌데 Track C로 판정되면 건너뛰기
                 if route_result["track"] == "C" and not is_closing_time:
                     logger.info(f"[Route] Track C지만 종가시간 아님 (15:00~) -> 대기")
+                    ai_skip_cache[ticker] = current_time
                     continue
 
                 # 단타(Track A)는 09:30~14:30만 허용 (장초반 변동성 회피 + 종배 겹침 방지)
                 if route_result["track"] == "A":
                     if current_hour == 9 and current_minute < 30:
                         logger.info(f"[Route] Track A는 09:30 이후부터 진입 가능 (장초반 변동성 회피) -> 대기")
+                        ai_skip_cache[ticker] = current_time
                         continue
                     if current_hour > 14 or (current_hour == 14 and current_minute >= 30):
                         logger.info(f"[Route] Track A는 오후 14:30까지만 진입 가능 -> 대기")
+                        ai_skip_cache[ticker] = current_time
                         continue
                     if orders.daily_track_a_losses >= 4:
                         logger.info(f"[Route] Track A 일일 손절 {orders.daily_track_a_losses}회 → 금일 Track A 비활성화")
+                        ai_skip_cache[ticker] = current_time
                         continue
 
                 # 본장 시간에 Track D(중장기)는 오후에만 허용
                 if route_result["track"] == "D" and current_hour < 14:
                     logger.info(f"[Route] Track D는 오후 진입 -> 대기")
+                    ai_skip_cache[ticker] = current_time
                     continue
 
                 # Track F는 God Mode 절대 금지 + 종가 기준 분할 매집만 허용

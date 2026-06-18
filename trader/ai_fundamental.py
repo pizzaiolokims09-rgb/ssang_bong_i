@@ -20,6 +20,8 @@ from typing import Optional
 import requests
 from dotenv import load_dotenv
 
+from trader import ai_budget
+
 load_dotenv()
 logger = logging.getLogger("ssangbong.fundamental")
 
@@ -46,16 +48,24 @@ class FundamentalScanner:
     # Gemini API 호출 (ai_router.py 패턴 답습)
     # ──────────────────────────────────────────
     def _call_gemini(self, prompt: str, use_pro: bool = True) -> Optional[str]:
-        """Gemini API 호출. Pro 실패 시 Flash 폴백."""
+        """Gemini API 호출. Pro 실패 시 Flash 폴백.
+        Pro는 일일 예산(ai_budget) 내에서만 사용하며, 초과 시 Flash로 우회한다."""
         models = [self.model_pro, self.model_flash] if use_pro else [self.model_flash]
 
         for model in models:
+            is_pro = "pro" in model.lower()
+            # 과금 폭탄 방지: Pro 일일 상한 초과 시 Pro를 건너뛰고 Flash로 우회
+            if is_pro and not ai_budget.allow_pro():
+                logger.warning(
+                    f"[Fundamental] Pro 일일 상한({ai_budget.DAILY_PRO_LIMIT}) 도달 → {model} 건너뜀")
+                continue
+
             url = f"{self.base_url}/{model}:generateContent?key={self.api_key}"
             payload = {
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {
                     "temperature": 0.1,
-                    "maxOutputTokens": 4096,
+                    "maxOutputTokens": 1024,  # 짧은 JSON 판정만 → 출력 토큰 절감
                 },
             }
             try:
@@ -63,6 +73,8 @@ class FundamentalScanner:
                 resp.raise_for_status()
                 data = resp.json()
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
+                if is_pro:
+                    ai_budget.record_pro()
                 return text.strip()
             except Exception as e:
                 logger.warning(f"[Fundamental] Gemini 호출 실패 ({model}): {e}")
@@ -72,17 +84,24 @@ class FundamentalScanner:
         return None
 
     def _call_gemini_with_search(self, prompt: str, use_pro: bool = True) -> Optional[str]:
-        """Gemini API 호출 (Google Search Grounding 활성화). 시황 리서치 전용."""
+        """Gemini API 호출 (Google Search Grounding 활성화). 시황 리서치 전용.
+        Pro는 일일 예산(ai_budget) 내에서만 사용한다."""
         models = [self.model_pro, self.model_flash] if use_pro else [self.model_flash]
 
         for model in models:
+            is_pro = "pro" in model.lower()
+            if is_pro and not ai_budget.allow_pro():
+                logger.warning(
+                    f"[Fundamental] Pro 일일 상한({ai_budget.DAILY_PRO_LIMIT}) 도달 → {model} 건너뜀")
+                continue
+
             url = f"{self.base_url}/{model}:generateContent?key={self.api_key}"
             payload = {
                 "contents": [{"parts": [{"text": prompt}]}],
                 "tools": [{"googleSearch": {}}],
                 "generationConfig": {
                     "temperature": 0.2,
-                    "maxOutputTokens": 4096,
+                    "maxOutputTokens": 2048,
                 },
             }
             try:
@@ -90,6 +109,8 @@ class FundamentalScanner:
                 resp.raise_for_status()
                 data = resp.json()
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
+                if is_pro:
+                    ai_budget.record_pro()
                 return text.strip()
             except Exception as e:
                 logger.warning(f"[Fundamental] Gemini Search 호출 실패 ({model}): {e}")
@@ -145,7 +166,7 @@ class FundamentalScanner:
 [출력 형식 (반드시 아래 JSON만 출력)]
 {{"verdict": "PASS", "reason": "...", "segment_pct": 0.15}}"""
 
-        raw = self._call_gemini(prompt, use_pro=True)
+        raw = self._call_gemini(prompt, use_pro=False)  # 스크리닝 검증은 Flash로 비용 절감
         if not raw:
             logger.warning(f"[Segment] AI 응답 실패 -> 안전하게 REDUCE 처리: {stock_name}")
             return {"verdict": self.REDUCE, "reason": "AI 응답 실패 (안전 모드)", "segment_pct": 0}
@@ -203,7 +224,7 @@ D등급: 심각한 신뢰 훼손 (횡령/배임/반복적 주주 기만) → "RE
 [출력 형식 (반드시 아래 JSON만 출력)]
 {{"verdict": "PASS", "trust_grade": "B", "reason": "..."}}"""
 
-        raw = self._call_gemini(prompt, use_pro=True)
+        raw = self._call_gemini(prompt, use_pro=False)  # 스크리닝 검증은 Flash로 비용 절감
         if not raw:
             logger.warning(f"[CEO Trust] AI 응답 실패 -> 안전하게 REJECT 처리: {stock_name}")
             return {"verdict": self.REJECT, "trust_grade": "?", "reason": "AI 응답 실패 (안전 모드)"}
@@ -270,7 +291,7 @@ D등급: 심각한 신뢰 훼손 (횡령/배임/반복적 주주 기만) → "RE
 [출력 형식 (반드시 아래 JSON만 출력)]
 {{"verdict": "PASS", "moat_score": 7, "turnaround": true, "reason": "..."}}"""
 
-        raw = self._call_gemini(prompt, use_pro=True)
+        raw = self._call_gemini(prompt, use_pro=False)  # 스크리닝 검증은 Flash로 비용 절감
         if not raw:
             logger.warning(f"[Moat] AI 응답 실패 -> REDUCE 처리: {stock_name}")
             return {"verdict": self.REDUCE, "moat_score": 0, "turnaround": False,
@@ -337,7 +358,7 @@ D등급: 심각한 신뢰 훼손 (횡령/배임/반복적 주주 기만) → "RE
 [출력 형식 (반드시 아래 JSON만 출력)]
 {{"verdict": "HOLD", "fatal_risks": [{{"risk": "...", "severity": "치명적"}}, {{"risk": "...", "severity": "경미"}}], "reason": "..."}}"""
 
-        raw = self._call_gemini(prompt, use_pro=True)
+        raw = self._call_gemini(prompt, use_pro=False)  # 스크리닝 검증은 Flash로 비용 절감
         if not raw:
             logger.warning(f"[Devil] AI 응답 실패 -> 안전하게 SELL 처리: {stock_name}")
             return {"verdict": "SELL", "fatal_risks": [{"risk": "AI 응답 실패", "severity": "치명적"}],
@@ -402,7 +423,7 @@ D등급: 심각한 신뢰 훼손 (횡령/배임/반복적 주주 기만) → "RE
 [출력 형식 (반드시 아래 JSON만 출력)]
 {{"verdict": "PASS", "risk_type": "none", "reason": "..."}}"""
 
-        raw = self._call_gemini(prompt, use_pro=True)
+        raw = self._call_gemini(prompt, use_pro=False)  # 스크리닝 검증은 Flash로 비용 절감
         if not raw:
             logger.warning(f"[Delisting] AI 응답 실패 -> 안전하게 REJECT 처리: {stock_name}")
             return {"verdict": self.REJECT, "risk_type": "ai_failure",
@@ -474,7 +495,7 @@ D등급: 심각한 신뢰 훼손 (횡령/배임/반복적 주주 기만) → "RE
 [출력 형식 (반드시 아래 JSON만 출력)]
 {{"verdict": "PASS", "sector": "반도체 후공정", "mega_trend_score": 8, "reason": "..."}}"""
 
-        raw = self._call_gemini(prompt, use_pro=True)
+        raw = self._call_gemini(prompt, use_pro=False)  # 스크리닝 검증은 Flash로 비용 절감
         if not raw:
             logger.warning(f"[MegaTrend] AI 응답 실패 -> 안전하게 REJECT 처리: {stock_name}")
             return {"verdict": self.REJECT, "sector": "unknown", "mega_trend_score": 0,

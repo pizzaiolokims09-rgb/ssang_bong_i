@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 
 from trader.signals import evaluate_smc_structure
 from trader.quant_indicators import wilder_atr
+from trader import ai_budget
 
 load_dotenv()
 logger = logging.getLogger("ssangbong.ai_router")
@@ -112,47 +113,60 @@ class MultiAssetCouncil:
 
     def __init__(self, api_key: str = None):
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
-        # 1차 추론: Pro 모델 (정밀 분석), fallback: Flash 모델 (안정/고속)
-        self.model_primary  = "gemini-3.1-pro-preview"  # 정밀 추론 (1차)
-        self.model_fallback = "gemini-3.5-flash"        # 안정 백업 (에러/타임아웃 시)
+        # 비용 절감: 라우팅(스크리닝)은 저비용 Flash를 1차로 사용한다.
+        # Pro는 Flash가 완전히 실패할 때만, 그리고 일일 예산(ai_budget) 내에서만 폴백.
+        self.model_primary  = "gemini-3.5-flash"        # 1차 (저비용/고속)
+        self.model_fallback = "gemini-3.1-pro-preview"  # 폴백 (Flash 실패 시, 예산 내)
         self.base_url = "https://generativelanguage.googleapis.com/v1beta/models"
 
     # ──────────────────────────────────────────
     # Gemini API 호출 (Pro → Flash 자동 폴백)
     # ──────────────────────────────────────────
     def _call_gemini(self, prompt: str, use_thinking: bool = False) -> Optional[str]:
-        """Gemini API 호출. Pro 모델 우선, 실패 시 Flash로 자동 폴백"""
+        """Gemini API 호출. Flash 우선(저비용), 실패 시에만 Pro 폴백.
+        Pro는 일일 예산(ai_budget) 내에서만 사용한다."""
         models_to_try = [self.model_primary, self.model_fallback]
+        last_idx = len(models_to_try) - 1
 
         for i, model in enumerate(models_to_try):
+            is_pro = "pro" in model.lower()
+            # 과금 폭탄 방지: Pro 일일 상한 초과 시 Pro 호출 자체를 건너뛴다.
+            if is_pro and not ai_budget.allow_pro():
+                logger.warning(
+                    f"[AI] Pro 일일 상한({ai_budget.DAILY_PRO_LIMIT}) 도달 → {model} 건너뜀")
+                continue
+
             url = f"{self.base_url}/{model}:generateContent?key={self.api_key}"
             payload = {
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {
                     "temperature": 0.1 if use_thinking else 0.3,
-                    "maxOutputTokens": 4096,
+                    # 응답은 짧은 JSON이므로 출력 토큰을 크게 줄여 비용 절감
+                    "maxOutputTokens": 2048,
                 },
             }
-            # Pro 모델은 타임아웃 넉넉히, Flash는 빠르게
-            # (감시는 별도 스레드지만, 스캔 사이클이 늘어지지 않도록 60초로 제한)
-            timeout = 60 if model == self.model_primary else 30
+            # Pro는 타임아웃 넉넉히, Flash는 빠르게
+            timeout = 60 if is_pro else 30
 
             try:
                 resp = requests.post(url, json=payload, timeout=timeout)
                 resp.raise_for_status()
                 data = resp.json()
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
+                if is_pro:
+                    ai_budget.record_pro()
                 if i > 0:
                     logger.info(f"[AI] 폴백 모델({model}) 추론 성공")
                 return text.strip()
             except Exception as e:
                 logger.warning(f"[AI] {model} 호출 실패 ({e})")
-                if i < len(models_to_try) - 1:
+                if i < last_idx:
                     logger.info(f"[AI] 폴백 모델({models_to_try[i+1]})로 재시도...")
                     continue
                 else:
                     logger.error(f"[AI] 모든 모델 호출 실패. 규칙 기반으로 폴백합니다.")
                     return None
+        return None
 
     # ──────────────────────────────────────────
     # 규칙 기반 사전 필터 (API 호출 최소화)
