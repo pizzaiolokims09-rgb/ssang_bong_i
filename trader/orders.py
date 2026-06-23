@@ -35,8 +35,11 @@ class OrderManager:
         self.total_capital     = float(os.environ.get("TOTAL_CAPITAL", 30_000_000))
         self.cash_buffer       = float(os.environ.get("CASH_BUFFER", 0.20))
         # 포트폴리오 슬롯 분리 (올라운더 전략)
-        self.max_short_positions = int(os.environ.get("MAX_SHORT_POSITIONS", 3)) # Track A, C
+        self.max_short_positions = int(os.environ.get("MAX_SHORT_POSITIONS", 3)) # Track A (+ 미분리 시 C 공유)
         self.max_swing_positions = int(os.environ.get("MAX_SWING_POSITIONS", 2)) # Track B, D
+        # Track C 전용 슬롯 (0 = 단기 풀을 A와 공유 = 기존 동작).
+        # MAX_C_POSITIONS>0 이고 BUDGET_C_PCT>0 이면 C가 A와 완전히 분리된다 (Phase B).
+        self.max_c_positions = int(os.environ.get("MAX_C_POSITIONS", 2))
 
         self._allocate_budgets()
 
@@ -73,12 +76,27 @@ class OrderManager:
         self._load_daily_state()
 
     def _allocate_budgets(self):
-        """트랙별 자본금 배분 (단기 35%, 스윙 20%, 메가트렌드 15%, 폭락주 10%)
-        현금 버퍼(20%)는 위기 대응용 예비금으로 남겨둠"""
-        self.short_capital = self.total_capital * 0.35
-        self.swing_capital = self.total_capital * 0.20
-        self.track_f_capital = self.total_capital * 0.15
-        self.track_e_capital = self.total_capital * 0.10
+        """트랙별 자본금 배분 (.env BUDGET_* 비율로 조정 가능).
+        기본값: 단기(A/C) 35%, 스윙(B/D) 20%, 메가트렌드(F) 15%, 폭락주(E) 10%.
+        현금 버퍼(CASH_BUFFER)는 위기 대응용 예비금으로 남겨둠.
+        track_c_capital: BUDGET_C_PCT=0 이면 C가 단기 풀(A)을 공유(기존 동작),
+                         >0 이면 C 전용 예산으로 분리 (Phase B)."""
+        # [Phase B 결정] 기본값에 'A 축소(20%) + C 분리(15%)' 반영 (.env 없는 서버에서도 적용).
+        short_pct = float(os.environ.get("BUDGET_SHORT_PCT", 0.20))   # 단기 A (손실 중 → 35%→20%)
+        swing_pct = float(os.environ.get("BUDGET_SWING_PCT", 0.20))
+        f_pct     = float(os.environ.get("BUDGET_F_PCT", 0.15))
+        e_pct     = float(os.environ.get("BUDGET_E_PCT", 0.10))        # Track E 제거됨(미사용 헤드룸)
+        c_pct     = float(os.environ.get("BUDGET_C_PCT", 0.15))       # 종가베팅 C 전용(검증 흑자)
+        self.short_capital   = self.total_capital * short_pct
+        self.swing_capital   = self.total_capital * swing_pct
+        self.track_f_capital = self.total_capital * f_pct
+        self.track_e_capital = self.total_capital * e_pct
+        self.track_c_capital = self.total_capital * c_pct  # 0이면 A와 공유
+
+    def _c_separated(self) -> bool:
+        """Track C가 단기(A) 풀에서 완전히 분리되었는지 여부.
+        BUDGET_C_PCT>0 (전용 예산) 그리고 MAX_C_POSITIONS>0 (전용 슬롯) 일 때만 분리."""
+        return getattr(self, "track_c_capital", 0) > 0 and self.max_c_positions > 0
 
     def sync_capital_from_balance(self):
         """실잔고 기반 복리 운용 (SYNC_CAPITAL=true 설정 시에만)
@@ -309,11 +327,16 @@ class OrderManager:
         return: (주문 수량, 종목당 할당 예산, 분할 비율 배열)
         """
         if track in ["A", "C"]:
-            # 단기 슬롯
-            budget_per_slot = self.short_capital / self.max_short_positions
             if track == "C":
-                target_ratio = [0.3, 0.7] # 종배: 1차 30%, 2차 70%
+                # 종배: 1차 30%, 2차 70%. 분리 시 C 전용 예산/슬롯 사용.
+                if self._c_separated():
+                    budget_per_slot = self.track_c_capital / self.max_c_positions
+                else:
+                    budget_per_slot = self.short_capital / self.max_short_positions
+                target_ratio = [0.3, 0.7]
             else:
+                # 단타(A): 단기 풀 슬롯. 분리 시에도 A는 short_capital 사용.
+                budget_per_slot = self.short_capital / self.max_short_positions
                 target_ratio = [1.0]      # 단타: 몰빵
         elif track == "E":
             # 폭락주 스나이핑: 전체 할당량(10%) 내 4단계 균등 분할
@@ -369,6 +392,18 @@ class OrderManager:
             logger.info(f"[Order] {ticker} SKIP 트랙 -> 매수 생략")
             return None
 
+        # 트랙 비활성화 스위치 (단일 관문 차단). A=Phase B, D/E=Phase D-4 제거.
+        _track_switch = {
+            "A": ("ENABLE_TRACK_A", "true"),   # 기본 가동
+            "D": ("ENABLE_TRACK_D", "false"),  # 기본 제거
+            "E": ("ENABLE_TRACK_E", "false"),  # 기본 제거
+        }
+        if track in _track_switch:
+            _key, _default = _track_switch[track]
+            if os.environ.get(_key, _default).lower() != "true":
+                logger.info(f"[Order] {ticker} Track {track} 비활성화({_key}=false) -> 매수 생략")
+                return None
+
         # 안전장치 #4: 킬 스위치
         if not self._check_kill_switch():
             return None
@@ -397,20 +432,30 @@ class OrderManager:
             return None
 
         # 트랙별 포지션 한도 (슬롯) 확인
-        short_count = sum(1 for p in self.positions.values() if p["track"] in ["A", "C"]) + \
-                      sum(1 for p in self.pending_orders.values() if p["track"] in ["A", "C"])
-        swing_count = sum(1 for p in self.positions.values() if p["track"] in ["B", "D"]) + \
-                      sum(1 for p in self.pending_orders.values() if p["track"] in ["B", "D"])
-        track_e_count = sum(1 for p in self.positions.values() if p["track"] == "E") + \
-                        sum(1 for p in self.pending_orders.values() if p["track"] == "E")
-        track_f_count = sum(1 for p in self.positions.values() if p["track"] == "F") + \
-                        sum(1 for p in self.pending_orders.values() if p["track"] == "F")
-        track_g_count = sum(1 for p in self.positions.values() if p["track"] == "G") + \
-                        sum(1 for p in self.pending_orders.values() if p["track"] == "G")
+        def _cnt(tracks):
+            return sum(1 for p in self.positions.values() if p["track"] in tracks) + \
+                   sum(1 for p in self.pending_orders.values() if p["track"] in tracks)
 
-        if track in ["A", "C"] and short_count >= self.max_short_positions:
-            logger.warning(f"[Order] 단기 포지션 한도({self.max_short_positions}) 도달 -> 진입 차단")
+        # C 분리 시 단기 풀은 A 단독, 미분리 시 A+C 공유 (기존 동작)
+        short_tracks = ["A"] if self._c_separated() else ["A", "C"]
+        short_count = _cnt(short_tracks)
+        c_count = _cnt(["C"])
+        swing_count = _cnt(["B", "D"])
+        track_e_count = _cnt(["E"])
+        track_f_count = _cnt(["F"])
+        track_g_count = _cnt(["G"])
+
+        if track == "A" and short_count >= self.max_short_positions:
+            logger.warning(f"[Order] 단기(A) 포지션 한도({self.max_short_positions}) 도달 -> 진입 차단")
             return None
+        if track == "C":
+            if self._c_separated():
+                if c_count >= self.max_c_positions:
+                    logger.warning(f"[Order] 종가베팅(C) 전용 슬롯 한도({self.max_c_positions}) 도달 -> 진입 차단")
+                    return None
+            elif short_count >= self.max_short_positions:
+                logger.warning(f"[Order] 단기(A/C 공유) 포지션 한도({self.max_short_positions}) 도달 -> 진입 차단")
+                return None
         if track in ["B", "D"] and swing_count >= self.max_swing_positions:
             logger.warning(f"[Order] 중장기 포지션 한도({self.max_swing_positions}) 도달 -> 진입 차단")
             return None
@@ -493,6 +538,18 @@ class OrderManager:
             self.entry_cooldown[ticker] = time.time()
             self._save_cooldowns()
 
+            # ML 피처 신뢰성: 라우팅 단계에서 비어 오면(rule-based 경로 등)
+            # 진입 시점 일봉으로 재계산하여 매매일지에 빈 dict가 기록되는 것을 방지.
+            quant_features = route_result.get("quant_features") or {}
+            if not quant_features:
+                try:
+                    from trader.quant_indicators import get_ml_features
+                    _daily = self.kis.get_daily_chart(ticker)
+                    quant_features = get_ml_features(_daily or [], [])
+                except Exception as e:
+                    logger.warning(f"[Order] {ticker} ML 피처 재계산 실패: {e}")
+                    quant_features = {}
+
             if is_market:
                 # 시장가: 즉시 체결 → positions에 등록
                 self.positions[ticker] = {
@@ -518,7 +575,7 @@ class OrderManager:
                     "atr_value": route_result.get("atr_value", 0),
                     "atr_sl_price": route_result.get("atr_sl_price", 0),
                     "atr_tp_price": route_result.get("atr_tp_price", 0),
-                    "quant_features": route_result.get("quant_features", {}),
+                    "quant_features": quant_features,
                 }
                 self._save_positions()
                 logger.info(f"[Order] 1차 시장가 체결: {ticker} Track {track} qty={quantity} (비율 {target_ratio[0]*100}%)")
@@ -548,7 +605,7 @@ class OrderManager:
                     "atr_value": route_result.get("atr_value", 0),
                     "atr_sl_price": route_result.get("atr_sl_price", 0),
                     "atr_tp_price": route_result.get("atr_tp_price", 0),
-                    "quant_features": route_result.get("quant_features", {}),
+                    "quant_features": quant_features,
                 }
                 self._save_pending()
                 logger.info(f"[Order] 지정가 매수 대기: {ticker} Track {track} qty={quantity} price={entry_price:,} (TTL={self.PENDING_TTL}초)")
@@ -727,6 +784,12 @@ class OrderManager:
             pos_track = pos.get("track", "A")
             pos_features = pos.get("quant_features", {})
 
+            # 종목명 견고화: 빈 문자열이나 티커로 떨어지지 않도록 우선순위 해석
+            # (매매일지 name 컬럼에 티커가 박히던 문제 방지)
+            resolved_name = quote.get("name") or ""
+            if not resolved_name or resolved_name == ticker:
+                resolved_name = pos_name if pos_name and pos_name != ticker else (pos_name or ticker)
+
             pos["quantity"] -= sell_qty
             if pos["quantity"] <= 0:
                 del self.positions[ticker]
@@ -735,7 +798,7 @@ class OrderManager:
             return {
                 "action": "SELL",
                 "ticker": ticker,
-                "name": quote.get("name", pos_name),
+                "name": resolved_name,
                 "quantity": sell_qty,
                 "entry_price": pos["entry_price"],
                 "sell_price": sell_price,

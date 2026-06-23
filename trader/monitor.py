@@ -3,6 +3,7 @@ monitor.py - 포지션 모니터링, 익절/손절 트레일링 스톱
 매뉴얼 Section 5 (안전장치 #3: Absolute Hard SL) 구현
 """
 import logging
+import os
 from datetime import datetime
 
 from trader.quant_indicators import get_sell_signals
@@ -346,8 +347,11 @@ class PositionMonitor:
                     except (ValueError, TypeError):
                         entry_time = datetime.now()
                 hold_minutes = (datetime.now() - entry_time).total_seconds() / 60
-                if hold_minutes > 30 and -0.005 <= change < 0.01:
-                    logger.info(f"[Monitor] Track A {ticker} 30분 경과, 본전/약수익 횡보 -> 정리")
+                # [Phase C] 타임아웃 설정화 + 30→60분 연장. 30분은 타점이 무르익기 전
+                # 본전 청산을 유발(AI 일일복기가 지목한 '타임아웃 손실')하므로 여유를 둔다.
+                timeout_min = float(os.environ.get("TRACK_A_TIMEOUT_MIN", 60))
+                if hold_minutes > timeout_min and -0.005 <= change < 0.01:
+                    logger.info(f"[Monitor] Track A {ticker} {timeout_min:.0f}분 경과, 본전/약수익 횡보 -> 정리")
                     r = self.orders.sell(ticker, reason="Track A 시간초과")
                     if r:
                         r["trigger"] = "TIMEOUT"

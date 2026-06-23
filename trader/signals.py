@@ -14,9 +14,11 @@ signals.py - Phase 1: Base Screener (1차 통합 조건 검색)
   - 발산 영역 진입 종목은 1분봉 거래량 폭발 감지 → God Mode 즉시 격발
 """
 import logging
+import os
 import re
 import time
 import requests
+import numpy as np
 import pandas as pd
 from bs4 import BeautifulSoup
 from typing import Optional
@@ -161,13 +163,16 @@ def calculate_atr(minute_candles: list, period: int = 20) -> float:
 # ──────────────────────────────────────────────
 # 엔벨로프 계산 함수 (Period: 20, Percent: 12.5)
 # ──────────────────────────────────────────────
-def calculate_envelope(daily_candles: list, period: int = 20, percent: float = 12.5) -> dict:
+def calculate_envelope(daily_candles: list, period: int = 20, percent: float = None) -> dict:
     """
     KIS API 일봉 데이터로 엔벨로프 상/하단선 계산.
     daily_candles: [{date, open, high, low, close, volume}, ...] (최신 데이터가 앞)
+    percent: 발산 폭(%). None이면 .env TRACK_A_ENVELOPE_PCT(기본 12.5) 사용 → Track A 타점 튜닝 지점.
 
     반환: {"ma20": int, "env_upper": int, "env_lower": int, "in_expansion": bool}
     """
+    if percent is None:
+        percent = float(os.environ.get("TRACK_A_ENVELOPE_PCT", 12.5))
     if len(daily_candles) < period:
         return {"ma20": 0, "env_upper": 0, "env_lower": 0, "in_expansion": False}
 
@@ -411,15 +416,31 @@ class BaseScreener:
     + 엔벨로프 발산 종목 태깅
     """
 
-    # 매뉴얼 기준 상수
-    MAX_MARKET_CAP = 15000   # 억원 (1조 5천억)
+    # 검색식 기본값 — .env(SCREEN_*)로 오버라이드 가능.
+    # [Phase B 결정] .env가 gitignore라 서버엔 새 키가 안 가므로, 결정값을 코드 기본값에 반영
+    # (pull만 하면 대형주 포함 유니버스로 구동). 되돌리려면 .env에 SCREEN_* 지정.
+    MAX_MARKET_CAP = 0       # 0 = 시총 상한 없음 (삼성·하이닉스 등 대형 주도주 포함)
     MIN_PRICE = 1000
-    MAX_PRICE = 50000
+    MAX_PRICE = 500000       # 고가 대형주(하이닉스 등) 포함
     MIN_TRADE_AMOUNT = 3_000_000_000   # 30억 (원)
     MIN_VOLUME = 1_000_000             # 100만 주
 
     def __init__(self, kis_client):
         self.kis = kis_client
+        # 유니버스 필터를 .env에서 로드 (상한값 0 이하 = 제한 없음).
+        # Phase B에서 .env만 바꾸면 검색 대상 유니버스가 바뀐다.
+        self.MAX_MARKET_CAP = int(os.environ.get("SCREEN_MAX_MARKET_CAP", self.MAX_MARKET_CAP))
+        self.MIN_PRICE = int(os.environ.get("SCREEN_MIN_PRICE", self.MIN_PRICE))
+        self.MAX_PRICE = int(os.environ.get("SCREEN_MAX_PRICE", self.MAX_PRICE))
+        self.MIN_TRADE_AMOUNT = int(os.environ.get("SCREEN_MIN_TRADE_AMOUNT", self.MIN_TRADE_AMOUNT))
+        self.MIN_VOLUME = int(os.environ.get("SCREEN_MIN_VOLUME", self.MIN_VOLUME))
+        self.SCAN_TOP_N = int(os.environ.get("SCREEN_SCAN_TOP_N", 150))
+        logger.info(
+            f"[Screener] 유니버스 필터: 시총<={self.MAX_MARKET_CAP if self.MAX_MARKET_CAP > 0 else '무제한'}억 "
+            f"가격 {self.MIN_PRICE:,}~{self.MAX_PRICE if self.MAX_PRICE > 0 else '무제한'} "
+            f"거래대금>={self.MIN_TRADE_AMOUNT//100_000_000}억 거래량>={self.MIN_VOLUME:,} "
+            f"상위{self.SCAN_TOP_N}"
+        )
 
     def scan(self) -> list:
         """
@@ -436,7 +457,7 @@ class BaseScreener:
         logger.info(f"[Screener] 실시간 거래량 상위 티커 획득: {len(tickers)}개")
 
         candidates = []
-        for item in tickers[:150]:  # 상위 150개 스캔 (실전 API라 빠름)
+        for item in tickers[:self.SCAN_TOP_N]:  # 상위 N개 스캔 (.env: SCREEN_SCAN_TOP_N)
             ticker = item["ticker"]
             name = item["name"]
 
@@ -465,12 +486,14 @@ class BaseScreener:
                 logger.info(f"[Screener] 당일 상장주 스캔 제외: {name}({ticker})")
                 continue
 
-            # 필터 3: 가격대
-            if not (self.MIN_PRICE <= current <= self.MAX_PRICE):
+            # 필터 3: 가격대 (MAX_PRICE<=0 이면 상한 없음)
+            if current < self.MIN_PRICE:
+                continue
+            if self.MAX_PRICE > 0 and current > self.MAX_PRICE:
                 continue
 
-            # 필터 4: 시가총액 (억원 단위)
-            if market_cap > self.MAX_MARKET_CAP and market_cap > 0:
+            # 필터 4: 시가총액 (억원 단위, MAX_MARKET_CAP<=0 이면 상한 없음)
+            if self.MAX_MARKET_CAP > 0 and market_cap > self.MAX_MARKET_CAP and market_cap > 0:
                 continue
 
             # 필터 5: 거래대금 30억 이상
@@ -627,8 +650,11 @@ class BaseScreener:
             if current < ma10 * 0.98 or current > ma5 * 1.03:
                 continue
 
-            # 조건 3: 정배열 (현재가 > MA20 && MA20 >= MA60)
-            if current <= ma20 or ma20 < ma60:
+            # 조건 3: 정배열 (현재가 > MA20 && MA20 >= MA60*(1+gap))
+            # [Phase D-4] 진입조건 강화: 백테스트상 B는 일봉 단독 엣지가 없고,
+            # '강한 정배열' 요구(gap)만 약한 신호를 걸러 품질을 높였다(.env TRACK_B_MIN_TREND_GAP).
+            min_trend_gap = float(os.environ.get("TRACK_B_MIN_TREND_GAP", 0.03))
+            if current <= ma20 or ma20 < ma60 * (1 + min_trend_gap):
                 continue
 
             stock_b = stock.copy()
@@ -994,10 +1020,13 @@ class BaseScreener:
                 continue
 
             # ── CCI(50) 계산 ──
+            # [Phase D 버그수정] raw=True는 numpy ndarray를 넘기는데 ndarray엔 .abs()가
+            # 없어 매 호출 예외 발생 → run.py try/except에 잡혀 Track G가 1.5개월간 0건이었음.
+            # np.abs 사용으로 수정 (백테스트 검증: 부활 시 기대값 +2.4%, 97거래/3년).
             typical_price = (df["high"] + df["low"] + df["close"]) / 3
             tp_ma = typical_price.rolling(window=50).mean()
             tp_md = typical_price.rolling(window=50).apply(
-                lambda x: (x - x.mean()).abs().mean(), raw=True
+                lambda x: np.abs(x - x.mean()).mean(), raw=True
             )
             cci = (typical_price - tp_ma) / (0.015 * tp_md)
 

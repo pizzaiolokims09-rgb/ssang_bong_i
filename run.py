@@ -50,6 +50,7 @@ def main():
     from trader.telegram_bot import TelegramBot
     from trader.journal import TradeJournal
     from trader.ai_fundamental import FundamentalScanner
+    from trader.minute_collector import MinuteCollector
 
     # ──────────────────────────────────────
     # 모듈 초기화
@@ -66,6 +67,7 @@ def main():
     telegram = TelegramBot()
     journal = TradeJournal(council)
     fundamental = FundamentalScanner()  # Phase 3: Fail-Close 최종 관문
+    collector = MinuteCollector()       # Track A 백테스트용 분봉 수집 (COLLECT_MINUTE_DATA=true 시)
 
     # 텔레그램 명령어 및 콜백 등록
     def cmd_status():
@@ -654,7 +656,9 @@ def main():
 
             # ─────── Phase 1.5: 눌림목 피벗 스나이핑 (Track A 즉시 격발) ───────
             # 09:30 이후 ~ 14:30 이전만 피벗 스나이핑 가동 (장초반 변동성 회피 + 종배 겹침 방지)
-            track_a_time_ok = (current_hour == 9 and current_minute >= 30) or (10 <= current_hour < 14) or (current_hour == 14 and current_minute < 30)
+            # Phase B: Track A 비활성화 시 비싼 AI 스캔 자체를 건너뜀 (orders.buy에서도 이중 차단)
+            track_a_enabled = os.environ.get("ENABLE_TRACK_A", "true").lower() == "true"
+            track_a_time_ok = track_a_enabled and ((current_hour == 9 and current_minute >= 30) or (10 <= current_hour < 14) or (current_hour == 14 and current_minute < 30))
             # 일일 Track A 손절 4회 이상이면 비활성화
             track_a_loss_blocked = orders.daily_track_a_losses >= 4
             if track_a_loss_blocked:
@@ -675,9 +679,17 @@ def main():
                     # 1분봉 조회
                     minute_candles = kis.get_minute_chart(p_ticker)
                     time.sleep(0.1)
-                    
+
                     if not minute_candles:
                         continue
+
+                    # Track A 백테스트용 분봉 수집 (이미 조회한 데이터 재활용, 추가 호출 0)
+                    collector.collect(p_ticker, p_stock["name"], minute_candles, context={
+                        "candidate": "track_a_pullback",
+                        "current": p_stock.get("current", 0),
+                        "change_pct": p_stock.get("change_pct", 0),
+                        "yesterday_high": p_stock.get("yesterday_high", 0),
+                    })
 
                     # 저변동성 필터: 1분 ATR이 가격의 0.15% 미만이면 호가 탄력이 없는
                     # 무거운 종목(ETF류 등) → 단타 회전 불가, Track A 부적합
@@ -871,10 +883,13 @@ def main():
                     else:
                         # ATR 계산 불가 시 피벗 로우 -2% fallback
                         dynamic_sl = int(pivot_low * 0.98)
-                    
-                    # 최소 -2%, 최대 -5% 범위로 클램핑
-                    sl_floor = int(p_stock["current"] * 0.95)  # -5% 최대 손절
-                    sl_ceil = int(p_stock["current"] * 0.98)   # -2% 최소 손절
+
+                    # [Phase C] 손절폭 클램핑(설정화). 가장 타이트한 손절을 -2%→-2.5%로
+                    # 넓혀 분봉 노이즈에 의한 휩쏘 손절(AI 일일복기가 지목한 '조기 손절')을 완화.
+                    sl_min_pct = float(os.environ.get("TRACK_A_SL_MIN_PCT", 0.025))  # 최타이트
+                    sl_max_pct = float(os.environ.get("TRACK_A_SL_MAX_PCT", 0.05))   # 최광폭
+                    sl_floor = int(p_stock["current"] * (1 - sl_max_pct))
+                    sl_ceil = int(p_stock["current"] * (1 - sl_min_pct))
                     dynamic_sl = max(sl_floor, min(dynamic_sl, sl_ceil))
                     
                     verified_route = {
@@ -941,8 +956,8 @@ def main():
                 except Exception as e:
                     logger.warning(f"[PreFilter] Track C 스캔 에러: {e}")
 
-            # Track D: 세력주 매집 (오후 14시 이후)
-            if current_hour >= 14:
+            # Track D: 세력주 매집 — [Phase D-4] 제거됨(공집합·1.5개월 0건). ENABLE_TRACK_D=true로만 부활.
+            if current_hour >= 14 and os.environ.get("ENABLE_TRACK_D", "false").lower() == "true":
                 try:
                     d_stocks = screener.scan_track_d(candidates[:10])
                     for s in d_stocks:
@@ -950,13 +965,14 @@ def main():
                 except Exception as e:
                     logger.warning(f"[PreFilter] Track D 스캔 에러: {e}")
 
-            # Track E: 폭락주 스나이핑 (항시, 상위 10개)
-            try:
-                e_stocks = screener.scan_track_e(candidates[:10])
-                for s in e_stocks:
-                    track_hints.setdefault(s["ticker"], []).append("E")
-            except Exception as e:
-                logger.warning(f"[PreFilter] Track E 스캔 에러: {e}")
+            # Track E: 폭락주 스나이핑 — [Phase D-4] 제거됨(백테스트 적자·체결 0). ENABLE_TRACK_E=true로만 부활.
+            if os.environ.get("ENABLE_TRACK_E", "false").lower() == "true":
+                try:
+                    e_stocks = screener.scan_track_e(candidates[:10])
+                    for s in e_stocks:
+                        track_hints.setdefault(s["ticker"], []).append("E")
+                except Exception as e:
+                    logger.warning(f"[PreFilter] Track E 스캔 에러: {e}")
 
             # Track F: 메가 트렌드 장기 눌림목 (항시, 상위 10개 + 수급주 유니버스)
             try:

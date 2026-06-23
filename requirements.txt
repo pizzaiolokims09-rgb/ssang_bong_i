@@ -1,8 +1,12 @@
 requests>=2.31.0
 python-dotenv>=1.0.0
 pandas>=2.0.0
+numpy>=1.24.0
 beautifulsoup4>=4.12.0
+lxml>=4.9.0
 pykrx>=1.0.45
+# Track A 피벗 스나이퍼 SMC 구조 분석(signals.evaluate_smc_structure)에 필요
+smartmoneyconcepts>=0.0.21
 # ML 승률 게이트(data/ml_brain.pkl) 사용 시 필요
 joblib>=1.3.0
 scikit-learn>=1.3.0
